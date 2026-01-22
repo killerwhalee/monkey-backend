@@ -1,0 +1,13 @@
+[project]
+name = "monkey-backend"
+version = "0.1.0"
+description = "Backend for monkey"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.0.1",
+    "django-cors-headers>=4.9.0",
+    "django-filter>=25.2",
+    "djangorestframework>=3.16.1",
+    "pre-commit>=4.5.1",
+]
