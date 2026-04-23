@@ -4,13 +4,17 @@ from django.db import models
 class Stock(models.Model):
     """Stock info"""
 
+    market = models.CharField(
+        "Stock market",
+        max_length=32,
+    )
+    ticker = models.CharField(
+        "Stock ticker",
+        max_length=16,
+    )
     name = models.CharField(
         "Stock name",
-        max_length=64,
-    )
-    code = models.CharField(
-        "Stock code",
-        max_length=16,
+        max_length=256,
     )
 
 
