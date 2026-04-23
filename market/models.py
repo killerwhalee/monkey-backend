@@ -17,6 +17,20 @@ class Stock(models.Model):
         max_length=256,
     )
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ticker", "market"],
+                name="unique_ticker_per_market",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"[{self.__class__.__name__} #{self.pk:04d}] "
+            f"{self.market} {self.ticker} {self.name}"
+        )
+
 
 class Holding(models.Model):
     monkey = models.ForeignKey(
