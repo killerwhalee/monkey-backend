@@ -2,6 +2,7 @@
 Django settings for monkey project.
 """
 
+from datetime import timedelta
 from pathlib import Path
 
 import environ
@@ -29,6 +30,16 @@ SECRET_KEY = env("DJANGO_SECRET")
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
     default=["127.0.0.1", "localhost"],
+)
+
+CORS_ALLOWED_ORIGINS = env.list(
+    "CORS_ALLOWED_ORIGINS",
+    default=["http://localhost:5173"],
+)
+
+CORS_ALLOW_CREDENTIALS = env.bool(
+    "CORS_ALLOW_CREDENTIALS",
+    default=True,
 )
 
 
@@ -76,6 +87,7 @@ CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -145,3 +157,52 @@ USE_TZ = True
 STATIC_URL = "static/"
 
 STATIC_ROOT = BASE_DIR / "_static"
+
+
+# KIS Open API
+
+KIS_APP_KEY = env("KIS_APP_KEY", default="")
+
+KIS_APP_SECRET = env("KIS_APP_SECRET", default="")
+
+KIS_CANO = env("KIS_CANO", default="")
+
+KIS_API_BASE_URL = env(
+    "KIS_API_BASE_URL",
+    default="https://openapivts.koreainvestment.com:29443",
+)
+
+KIS_ENVIRONMENT = env(
+    "KIS_ENVIRONMENT",
+    default="virtual",
+)
+
+KIS_ACNT_PRDT_CD = env(
+    "KIS_ACNT_PRDT_CD",
+    default="01",
+)
+
+KIS_TOKEN_REFRESH_MARGIN_SECONDS = env.int(
+    "KIS_TOKEN_REFRESH_MARGIN_SECONDS",
+    default=300,
+)
+
+
+# Django REST Framework
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+}
+
+
+# Simple JWT configuration
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "ROTATE_REFRESH_TOKENS": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
