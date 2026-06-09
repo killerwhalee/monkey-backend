@@ -1,0 +1,190 @@
+from rest_framework import serializers
+
+from market.models import Holding, Order
+from market.serializers import HoldingSerializer, OrderSerializer
+from monkey import services
+from monkey.models import GlobalMonkeyControl, KisAccessToken, Monkey
+
+
+class MonkeySerializer(serializers.ModelSerializer):
+    holdings = serializers.SerializerMethodField()
+    recent_orders = serializers.SerializerMethodField()
+    metrics = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Monkey
+        fields = [
+            "id",
+            "name",
+            "is_active",
+            "balance",
+            "initial_balance",
+            "min_quantity",
+            "max_quantity",
+            "holdings",
+            "recent_orders",
+            "metrics",
+        ]
+
+    def validate(self, attrs):
+        min_quantity = attrs.get(
+            "min_quantity", getattr(self.instance, "min_quantity", 1)
+        )
+        max_quantity = attrs.get(
+            "max_quantity", getattr(self.instance, "max_quantity", 1)
+        )
+        if min_quantity < 1:
+            raise serializers.ValidationError(
+                {"min_quantity": "Minimum quantity must be at least 1."}
+            )
+        if max_quantity < min_quantity:
+            raise serializers.ValidationError(
+                {
+                    "max_quantity": "Maximum quantity must be greater than or equal to minimum quantity."
+                }
+            )
+        return attrs
+
+    def get_holdings(self, obj):
+        holdings = Holding.objects.filter(monkey=obj, quantity__gt=0).select_related(
+            "stock"
+        )
+        return HoldingSerializer(holdings, many=True).data
+
+    def get_recent_orders(self, obj):
+        orders = (
+            Order.objects.filter(monkey=obj)
+            .select_related("stock")
+            .order_by("-created_at")[:10]
+        )
+        return OrderSerializer(orders, many=True).data
+
+    def get_metrics(self, obj):
+        return build_monkey_metrics(obj)
+
+
+class MonkeyBulkCreateSerializer(serializers.Serializer):
+    count = serializers.IntegerField(min_value=1, max_value=1000)
+    starting_balance = serializers.IntegerField(min_value=0)
+    min_quantity = serializers.IntegerField(min_value=1, default=1)
+    max_quantity = serializers.IntegerField(min_value=1, default=1)
+
+    def validate(self, attrs):
+        if attrs["max_quantity"] < attrs["min_quantity"]:
+            raise serializers.ValidationError(
+                {
+                    "max_quantity": "Maximum quantity must be greater than or equal to minimum quantity."
+                }
+            )
+        return attrs
+
+    def create(self, validated_data):
+        return services.create_monkeys(**validated_data)
+
+
+class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GlobalMonkeyControl
+        fields = [
+            "id",
+            "enabled",
+            "note",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class KisAccessTokenSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = KisAccessToken
+        fields = [
+            "id",
+            "environment",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class DailyEarningRatioPointSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    average_earning_ratio = serializers.FloatField()
+    best_earning_ratio = serializers.FloatField()
+
+
+class DashboardSummarySerializer(serializers.Serializer):
+    active_monkey_count = serializers.IntegerField()
+    average_earning_ratio = serializers.FloatField()
+    best_earning_ratio = serializers.FloatField()
+    latest_orders = OrderSerializer(many=True)
+    daily_earning_ratio_series = DailyEarningRatioPointSerializer(many=True)
+
+
+def build_monkey_metrics(monkey):
+    holdings_value = 0
+    unrealized_pl = 0
+    realized_pl = 0
+
+    for holding in Holding.objects.filter(monkey=monkey).select_related("stock"):
+        last_price = _latest_stock_price(monkey, holding.stock_id)
+        holdings_value += holding.quantity * last_price
+        basis, realized_for_stock = _stock_profit(monkey, holding.stock_id, last_price)
+        unrealized_pl += holding.quantity * last_price - basis
+        realized_pl += realized_for_stock
+
+    total_equity = monkey.balance + holdings_value
+    total_pl = total_equity - monkey.initial_balance
+    earning_ratio = (
+        (total_pl / monkey.initial_balance) if monkey.initial_balance else 0.0
+    )
+    return {
+        "cash_balance": monkey.balance,
+        "holdings_value": holdings_value,
+        "total_equity": total_equity,
+        "total_pl": total_pl,
+        "realized_pl": realized_pl,
+        "unrealized_pl": unrealized_pl,
+        "earning_ratio": earning_ratio,
+    }
+
+
+def _latest_stock_price(monkey, stock_id):
+    order = (
+        Order.objects.filter(
+            monkey=monkey,
+            stock_id=stock_id,
+            status=Order.StatusChoices.SUCCEEDED,
+        )
+        .exclude(estimated_price__isnull=True)
+        .order_by("-created_at")
+        .first()
+    )
+    if not order:
+        return 0
+    return order.executed_price or order.estimated_price or 0
+
+
+def _stock_profit(monkey, stock_id, current_price):
+    quantity = 0
+    cost_basis = 0
+    realized_pl = 0
+    orders = Order.objects.filter(
+        monkey=monkey,
+        stock_id=stock_id,
+        status=Order.StatusChoices.SUCCEEDED,
+    ).order_by("created_at", "id")
+
+    for order in orders:
+        price = order.executed_price or order.estimated_price or current_price
+        if order.order_type == Order.OrderTypeChoices.BUY:
+            quantity += order.executed_quantity
+            cost_basis += order.executed_quantity * price
+        else:
+            if quantity:
+                average_cost = cost_basis / quantity
+                sold_basis = average_cost * order.executed_quantity
+                cost_basis -= sold_basis
+                quantity -= order.executed_quantity
+                realized_pl += order.executed_quantity * price - sold_basis
+
+    return round(cost_basis), round(realized_pl)

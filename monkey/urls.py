@@ -1,0 +1,23 @@
+from django.urls import path
+from rest_framework.routers import DefaultRouter
+
+from monkey import viewsets
+
+router = DefaultRouter()
+router.register("monkeys", viewsets.MonkeyViewSet, basename="monkey")
+router.register(
+    "global-monkey-control",
+    viewsets.GlobalMonkeyControlViewSet,
+    basename="global-monkey-control",
+)
+router.register(
+    "kis-access-tokens", viewsets.KisAccessTokenViewSet, basename="kis-access-token"
+)
+
+urlpatterns = router.urls + [
+    path(
+        "dashboard-summary/",
+        viewsets.DashboardSummaryView.as_view(),
+        name="dashboard-summary",
+    ),
+]
