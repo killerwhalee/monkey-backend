@@ -88,6 +88,8 @@ class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "enabled",
+            "kill_threshold",
+            "order_interval_seconds",
             "note",
             "created_at",
             "updated_at",

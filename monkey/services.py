@@ -17,6 +17,33 @@ def get_global_control():
     return control
 
 
+def set_trading_enabled(enabled: bool, note: str = "") -> GlobalMonkeyControl:
+    """Set GlobalMonkeyControl.enabled. Used by market_open / market_close tasks."""
+    control = get_global_control()
+    control.enabled = enabled
+    if note:
+        control.note = note
+    control.save(update_fields=["enabled", "note", "updated_at"])
+    return control
+
+
+def maybe_kill_monkey(monkey: Monkey) -> bool:
+    """
+    Deactivate monkey if earning_ratio < kill_threshold. Returns True if killed.
+    The Monkey.save() override will automatically sync PeriodicTask.enabled=False.
+    """
+    # Deferred import: serializers.py does `from monkey import services`.
+    from monkey.serializers import build_monkey_metrics
+
+    control = get_global_control()
+    if build_monkey_metrics(monkey)["earning_ratio"] < control.kill_threshold:
+        monkey.is_active = False
+        monkey.killed_at = timezone.now()
+        monkey.save(update_fields=["is_active", "killed_at"])
+        return True
+    return False
+
+
 def snapshot_all_monkeys(target_date=None):
     # Deferred import: serializers.py does `from monkey import services`, so importing
     # build_monkey_metrics at module load time would create a circular import (same
@@ -63,17 +90,20 @@ def build_dashboard_summary():
 
 
 def create_monkeys(count, starting_balance, min_quantity=1, max_quantity=1):
-    monkeys = [
-        Monkey(
-            name=f"Monkey {Monkey.objects.count() + index + 1}",
+    # Individual saves (not bulk_create) so Monkey.save() fires and creates PeriodicTasks.
+    base_count = Monkey.objects.count()
+    monkeys = []
+    for index in range(count):
+        monkey = Monkey(
+            name=f"Monkey {base_count + index + 1}",
             balance=starting_balance,
             initial_balance=starting_balance,
             min_quantity=min_quantity,
             max_quantity=max_quantity,
         )
-        for index in range(count)
-    ]
-    return Monkey.objects.bulk_create(monkeys)
+        monkey.save()
+        monkeys.append(monkey)
+    return monkeys
 
 
 def run_active_monkeys():
@@ -128,13 +158,18 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
             )
         stock = holding.stock
 
-    return submit_monkey_order(
+    order = submit_monkey_order(
         monkey_id=monkey.id,
         stock_id=stock.id,
         order_type=order_type,
         quantity=quantity,
         kis_client=kis_client,
     )
+    # Kill check outside the atomic block: refresh balance first since submit_monkey_order
+    # updated it in its own transaction.
+    monkey.refresh_from_db()
+    maybe_kill_monkey(monkey)
+    return order
 
 
 @transaction.atomic
