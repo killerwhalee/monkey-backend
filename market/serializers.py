@@ -31,6 +31,7 @@ class HoldingSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     stock = StockSerializer(read_only=True)
     monkey_id = serializers.IntegerField(source="monkey.id", read_only=True)
+    monkey_name = serializers.CharField(source="monkey.name", read_only=True)
     order_type_label = serializers.CharField(
         source="get_order_type_display",
         read_only=True,
@@ -43,6 +44,7 @@ class OrderSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "monkey_id",
+            "monkey_name",
             "stock",
             "order_type",
             "order_type_label",
