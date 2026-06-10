@@ -48,6 +48,7 @@ CORS_ALLOW_CREDENTIALS = env.bool(
 INSTALLED_APPS = [
     # vendor apps
     "rest_framework",
+    "django_filters",
     "corsheaders",
     "django_celery_beat",
     "django_celery_results",
@@ -194,6 +195,9 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
         "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
     ],
 }
 
