@@ -34,10 +34,7 @@ def remove_snapshot_schedule(apps, schema_editor):
 class Migration(migrations.Migration):
     dependencies = [
         ("monkey", "0003_monkeydailysnapshot"),
-        (
-            "django_celery_beat",
-            "0015_alter_clockedschedule_id_alter_crontabschedule_id_and_more",
-        ),
+        ("django_celery_beat", "0019_alter_periodictasks_options"),
     ]
 
     operations = [

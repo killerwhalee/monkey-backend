@@ -36,10 +36,6 @@ class Migration(migrations.Migration):
     dependencies = [
         ("monkey", "0005_add_globalcontrol_fields_and_killed_at"),
         ("django_celery_beat", "0019_alter_periodictasks_options"),
-        (
-            "django_celery_beat",
-            "0015_alter_clockedschedule_id_alter_crontabschedule_id_and_more",
-        ),
     ]
 
     operations = [
