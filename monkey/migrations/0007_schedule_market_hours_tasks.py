@@ -50,7 +50,6 @@ def remove_market_schedules(apps, schema_editor):
 class Migration(migrations.Migration):
     dependencies = [
         ("monkey", "0006_create_per_monkey_periodic_tasks"),
-        ("django_celery_beat", "0020_merge_20260609_2109"),
     ]
 
     operations = [
