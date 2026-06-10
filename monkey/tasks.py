@@ -25,11 +25,22 @@ def run_monkeys():
 
 @shared_task
 def run_monkey(monkey_id):
+    if not services.get_global_control().enabled:
+        return {"enabled": False, "monkey_id": monkey_id}
     order = services.run_random_monkey_order(monkey_id)
-    return {
-        "order_id": order.id,
-        "status": order.status,
-    }
+    return {"order_id": order.id, "status": order.status}
+
+
+@shared_task
+def market_open():
+    services.set_trading_enabled(True, note="장 시작 (자동)")
+    return {"enabled": True}
+
+
+@shared_task
+def market_close():
+    services.set_trading_enabled(False, note="장 마감 (자동)")
+    return {"enabled": False}
 
 
 @shared_task
