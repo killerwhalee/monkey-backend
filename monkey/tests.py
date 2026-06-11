@@ -242,7 +242,7 @@ class MonkeyApiTests(APITestCase):
         )
 
         self.assertEqual(read_response.status_code, 200)
-        self.assertEqual(write_response.status_code, 403)
+        self.assertEqual(write_response.status_code, 401)
 
     def test_admin_can_bulk_create_monkeys(self):
         user = get_user_model().objects.create_user(
