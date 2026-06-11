@@ -216,8 +216,8 @@ uv run celery -A core worker -l info
 uv run celery -A core beat -l info
 ```
 
-All three depend on Redis being up (`CELERY_BROKER_URL = redis://127.0.0.1:6379/0`, hardcoded in
-`core/settings.py`) and on the `.env`/migrations steps above being completed.
+All three depend on Redis being up (`CELERY_BROKER_URL`, defaulting to `redis://127.0.0.1:6379/0`
+but configurable via `.env`) and on the `.env`/migrations steps above being completed.
 
 ## 10. Verify the setup
 

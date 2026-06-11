@@ -1,0 +1,28 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            export PATH="$HOME/.local/bin:$PATH"
+            cd /home/killerwhalee/monkey/backend
+            git checkout main
+            git pull --ff-only origin main
+            uv sync --frozen
+            uv run python manage.py migrate --noinput
+            uv run python manage.py collectstatic --noinput
+            sudo systemctl restart monkey.target
