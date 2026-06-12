@@ -229,6 +229,42 @@ class MonkeyServiceTests(TestCase):
         self.assertEqual(order.requested_quantity, 4)
         self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
 
+    def test_random_sell_order_picks_holding_stock_and_caps_quantity(self):
+        monkey = Monkey.objects.create(
+            name="A",
+            balance=5000,
+            initial_balance=5000,
+            min_quantity=1,
+            max_quantity=10,
+        )
+        other_stock = Stock.objects.create(
+            market="KOSPI",
+            ticker="000660",
+            name="SK Hynix",
+        )
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+
+        class Rng:
+            def choice(self, values):
+                return Order.OrderTypeChoices.SELL
+
+            def randint(self, start, end):
+                return end
+
+        order = services.run_random_monkey_order(
+            monkey.id,
+            kis_client=FakeKisClient(price=100),
+            rng=Rng(),
+        )
+
+        self.assertEqual(order.stock_id, self.stock.id)
+        self.assertNotEqual(order.stock_id, other_stock.id)
+        self.assertEqual(order.requested_quantity, 2)
+        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 0
+        )
+
 
 class MonkeyApiTests(APITestCase):
     def test_public_can_read_monkeys_but_not_bulk_create(self):

@@ -157,6 +157,9 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 failure_reason="Monkey has no holdings to sell.",
             )
         stock = holding.stock
+        sell_max = min(monkey.max_quantity, holding.quantity)
+        sell_min = min(monkey.min_quantity, sell_max)
+        quantity = rng.randint(sell_min, sell_max)
 
     order = submit_monkey_order(
         monkey_id=monkey.id,
