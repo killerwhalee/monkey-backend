@@ -17,6 +17,11 @@ class Stock(models.Model):
         "Stock name",
         max_length=256,
     )
+    is_active = models.BooleanField(
+        "Is active?",
+        default=True,
+        help_text="Whether this stock is currently listed on its market.",
+    )
 
     class Meta:
         constraints = [

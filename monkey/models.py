@@ -1,8 +1,7 @@
 import json
 
-from django.core.validators import MinValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import OperationalError, ProgrammingError, models
-from django.db.models import F, Q
 
 
 class GlobalMonkeyControl(models.Model):
@@ -22,11 +21,6 @@ class GlobalMonkeyControl(models.Model):
         default=-0.5,
         help_text="Monkeys whose earning_ratio drops below this value are automatically deactivated.",
     )
-    order_interval_seconds = models.PositiveIntegerField(
-        "Order interval (seconds)",
-        default=60,
-        help_text="How often each monkey places a random order.",
-    )
     created_at = models.DateTimeField(
         "Created at",
         auto_now_add=True,
@@ -35,33 +29,6 @@ class GlobalMonkeyControl(models.Model):
         "Updated at",
         auto_now=True,
     )
-
-    def save(self, *args, **kwargs):
-        # Resync all per-monkey PeriodicTask intervals when order_interval_seconds changes.
-        update_fields = kwargs.get("update_fields")
-        interval_changed = False
-        if update_fields is None or "order_interval_seconds" in update_fields:
-            try:
-                old = GlobalMonkeyControl.objects.values_list(
-                    "order_interval_seconds", flat=True
-                ).get(pk=self.pk)
-                interval_changed = old != self.order_interval_seconds
-            except GlobalMonkeyControl.DoesNotExist:
-                pass
-        super().save(*args, **kwargs)
-        if interval_changed:
-            try:
-                from django_celery_beat.models import IntervalSchedule, PeriodicTask
-
-                interval, _ = IntervalSchedule.objects.get_or_create(
-                    every=self.order_interval_seconds,
-                    period=IntervalSchedule.SECONDS,
-                )
-                PeriodicTask.objects.filter(task="monkey.tasks.run_monkey").update(
-                    interval=interval
-                )
-            except (OperationalError, ProgrammingError):
-                pass
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] enabled={self.enabled}"
@@ -115,15 +82,16 @@ class Monkey(models.Model):
         default=0,
         validators=[MinValueValidator(0)],
     )
-    min_quantity = models.PositiveIntegerField(
-        "Minimum order quantity",
-        default=1,
-        validators=[MinValueValidator(1)],
+    order_interval_seconds = models.PositiveIntegerField(
+        "Order interval (seconds)",
+        default=60,
+        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        help_text="How often this monkey places a random order.",
     )
-    max_quantity = models.PositiveIntegerField(
-        "Maximum order quantity",
-        default=1,
-        validators=[MinValueValidator(1)],
+    is_system = models.BooleanField(
+        "Is system monkey?",
+        default=False,
+        help_text="Hidden monkey used to absorb/liquidate orphaned real-account positions.",
     )
     killed_at = models.DateTimeField(
         "Killed at",
@@ -141,12 +109,8 @@ class Monkey(models.Model):
             from django_celery_beat.models import IntervalSchedule, PeriodicTask
 
             if is_new:
-                # Deferred import: services.py imports from models.py at module level.
-                from monkey.services import get_global_control
-
-                control = get_global_control()
                 interval, _ = IntervalSchedule.objects.get_or_create(
-                    every=control.order_interval_seconds,
+                    every=self.order_interval_seconds,
                     period=IntervalSchedule.SECONDS,
                 )
                 PeriodicTask.objects.get_or_create(
@@ -173,29 +137,6 @@ class Monkey(models.Model):
         except (OperationalError, ProgrammingError):
             pass
         super().delete(*args, **kwargs)
-
-    def clean(self):
-        super().clean()
-        if self.max_quantity < self.min_quantity:
-            from django.core.exceptions import ValidationError
-
-            raise ValidationError(
-                {
-                    "max_quantity": "Maximum quantity must be greater than or equal to minimum quantity."
-                }
-            )
-
-    class Meta:
-        constraints = [
-            models.CheckConstraint(
-                condition=Q(min_quantity__gte=1),
-                name="monkey_min_quantity_gte_1",
-            ),
-            models.CheckConstraint(
-                condition=Q(max_quantity__gte=F("min_quantity")),
-                name="monkey_max_quantity_gte_min_quantity",
-            ),
-        ]
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] {self.name}"
@@ -252,4 +193,29 @@ class MonkeyDailySnapshot(models.Model):
         return (
             f"[{self.__class__.__name__} #{self.pk:04d}] "
             f"{self.monkey_id} {self.date} ratio={self.earning_ratio}"
+        )
+
+
+class MonkeyEarningRatioTick(models.Model):
+    """Per-minute sample of the average earning ratio across all monkeys.
+
+    Used to build a daily candlestick chart (open/high/low/close per day).
+    """
+
+    recorded_at = models.DateTimeField(
+        "Recorded at",
+        auto_now_add=True,
+        db_index=True,
+    )
+    average_earning_ratio = models.FloatField(
+        "Average earning ratio",
+    )
+
+    class Meta:
+        ordering = ["recorded_at"]
+
+    def __str__(self):
+        return (
+            f"[{self.__class__.__name__} #{self.pk:04d}] "
+            f"{self.recorded_at} ratio={self.average_earning_ratio}"
         )
