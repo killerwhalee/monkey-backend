@@ -15,7 +15,9 @@ from monkey.serializers import build_monkey_metrics
 
 
 class FakeKisClient:
-    def __init__(self, price=1000, response=None, fail_order=False):
+    def __init__(
+        self, price=1000, response=None, fail_order=False, balance=0, holdings=None
+    ):
         self.price = price
         self.response = response or {
             "rt_cd": "0",
@@ -24,9 +26,14 @@ class FakeKisClient:
         }
         self.fail_order = fail_order
         self.orders = []
+        self.balance = balance
+        self.holdings = holdings or {}
 
     def get_stock_price(self, ticker):
         return self.price
+
+    def get_account_balance(self):
+        return {"cash_balance": self.balance, "holdings": self.holdings}
 
     def order_stock(self, order_type, ticker, quantity):
         self.orders.append(
@@ -204,21 +211,16 @@ class MonkeyServiceTests(TestCase):
         self.assertEqual(result["enabled"], False)
         self.assertEqual(Order.objects.count(), 0)
 
-    def test_random_order_uses_monkey_quantity_bounds(self):
+    def test_random_order_quantity_is_always_one(self):
         monkey = Monkey.objects.create(
             name="A",
             balance=5000,
             initial_balance=5000,
-            min_quantity=4,
-            max_quantity=4,
         )
 
         class Rng:
             def choice(self, values):
                 return Order.OrderTypeChoices.BUY
-
-            def randint(self, start, end):
-                return end
 
         order = services.run_random_monkey_order(
             monkey.id,
@@ -226,16 +228,14 @@ class MonkeyServiceTests(TestCase):
             rng=Rng(),
         )
 
-        self.assertEqual(order.requested_quantity, 4)
+        self.assertEqual(order.requested_quantity, 1)
         self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
 
-    def test_random_sell_order_picks_holding_stock_and_caps_quantity(self):
+    def test_random_sell_order_picks_holding_stock_and_sells_one_share(self):
         monkey = Monkey.objects.create(
             name="A",
             balance=5000,
             initial_balance=5000,
-            min_quantity=1,
-            max_quantity=10,
         )
         other_stock = Stock.objects.create(
             market="KOSPI",
@@ -248,9 +248,6 @@ class MonkeyServiceTests(TestCase):
             def choice(self, values):
                 return Order.OrderTypeChoices.SELL
 
-            def randint(self, start, end):
-                return end
-
         order = services.run_random_monkey_order(
             monkey.id,
             kis_client=FakeKisClient(price=100),
@@ -259,10 +256,131 @@ class MonkeyServiceTests(TestCase):
 
         self.assertEqual(order.stock_id, self.stock.id)
         self.assertNotEqual(order.stock_id, other_stock.id)
-        self.assertEqual(order.requested_quantity, 2)
+        self.assertEqual(order.requested_quantity, 1)
         self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
         self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 1
+        )
+
+    def test_create_monkeys_assigns_pet_names_and_intervals(self):
+        with mock.patch("monkey.names.random.choice", return_value="Arthur"):
+            first = services.create_monkeys(count=1, starting_balance=1000)[0]
+            second = services.create_monkeys(count=1, starting_balance=1000)[0]
+            third = services.create_monkeys(count=1, starting_balance=1000)[0]
+
+        self.assertEqual(first.name, "Arthur")
+        self.assertEqual(second.name, "Arthur II")
+        self.assertEqual(third.name, "Arthur III")
+        for monkey in (first, second, third):
+            self.assertTrue(60 <= monkey.order_interval_seconds <= 1800)
+
+    def test_kill_monkey_liquidates_all_holdings(self):
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        other_stock = Stock.objects.create(
+            market="KOSPI", ticker="000660", name="SK Hynix"
+        )
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+        Holding.objects.create(monkey=monkey, stock=other_stock, quantity=3)
+
+        with mock.patch(
+            "monkey.services.KisClient", return_value=FakeKisClient(price=100)
+        ):
+            services.kill_monkey(monkey)
+
+        monkey.refresh_from_db()
+        self.assertFalse(monkey.is_active)
+        self.assertIsNotNone(monkey.killed_at)
+        self.assertEqual(
             Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 0
+        )
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=other_stock).quantity, 0
+        )
+        sell_orders = Order.objects.filter(
+            monkey=monkey,
+            order_type=Order.OrderTypeChoices.SELL,
+            status=Order.StatusChoices.SUCCEEDED,
+        )
+        self.assertEqual(sell_orders.count(), 2)
+
+    def test_auto_create_monkeys_uses_kis_cash_balance(self):
+        Monkey.objects.create(name="A", balance=1_000_000, initial_balance=1_000_000)
+        fake_client = FakeKisClient(balance=3_000_000)
+
+        monkeys = services.auto_create_monkeys(kis_client=fake_client)
+
+        self.assertEqual(len(monkeys), 2)
+        self.assertEqual(Monkey.objects.filter(is_system=False).count(), 3)
+        for monkey in monkeys:
+            self.assertEqual(monkey.balance, services.AUTO_CREATE_STARTING_BALANCE)
+
+
+class OrphanedHoldingsTests(TestCase):
+    def setUp(self):
+        self.stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung Electronics"
+        )
+
+    def test_reconcile_holdings_absorbs_excess_into_system_monkey_and_sells(self):
+        fake_client = FakeKisClient(price=100, holdings={"005930": 5})
+
+        result = services.reconcile_holdings(kis_client=fake_client)
+
+        self.assertEqual(len(result["absorbed"]), 1)
+        absorbed = result["absorbed"][0]
+        self.assertEqual(absorbed["ticker"], "005930")
+        self.assertEqual(absorbed["quantity"], 5)
+        self.assertEqual(result["clamped"], [])
+
+        system_monkey = Monkey.objects.get(is_system=True)
+        holding = Holding.objects.get(monkey=system_monkey, stock=self.stock)
+        self.assertEqual(holding.quantity, 0)
+
+        order = Order.objects.get(id=absorbed["order_ids"][0])
+        self.assertEqual(order.order_type, Order.OrderTypeChoices.SELL)
+        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.executed_quantity, 5)
+
+    def test_reconcile_holdings_clamps_phantom_holdings(self):
+        monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        holding = Holding.objects.create(monkey=monkey, stock=self.stock, quantity=5)
+
+        fake_client = FakeKisClient(price=100, holdings={"005930": 2})
+
+        result = services.reconcile_holdings(kis_client=fake_client)
+
+        self.assertEqual(result["absorbed"], [])
+        self.assertEqual(len(result["clamped"]), 1)
+        clamped = result["clamped"][0]
+        self.assertEqual(clamped["ticker"], "005930")
+        self.assertEqual(clamped["quantity"], 3)
+
+        holding.refresh_from_db()
+        self.assertEqual(holding.quantity, 2)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_liquidate_orphaned_holdings_only_targets_delisted_stocks(self):
+        services.set_trading_enabled(True)
+
+        delisted_stock = Stock.objects.create(
+            market="KOSPI", ticker="999999", name="Delisted Co", is_active=False
+        )
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+        Holding.objects.create(monkey=monkey, stock=delisted_stock, quantity=1)
+
+        fake_client = FakeKisClient(price=100, holdings={"005930": 2, "999999": 1})
+
+        with mock.patch("monkey.services.KisClient", return_value=fake_client):
+            result = services.liquidate_orphaned_holdings()
+
+        self.assertTrue(result["enabled"])
+        self.assertEqual(result["delisted_orders"], 1)
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 2
+        )
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=delisted_stock).quantity, 0
         )
 
 
@@ -293,14 +411,53 @@ class MonkeyApiTests(APITestCase):
             {
                 "count": 2,
                 "starting_balance": 1000,
-                "min_quantity": 1,
-                "max_quantity": 1,
             },
             format="json",
         )
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Monkey.objects.count(), 2)
+
+    def test_force_kill_endpoint_requires_admin_and_liquidates(self):
+        stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung Electronics"
+        )
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        Holding.objects.create(monkey=monkey, stock=stock, quantity=2)
+
+        response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
+        self.assertEqual(response.status_code, 401)
+
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+
+        with mock.patch(
+            "monkey.services.KisClient", return_value=FakeKisClient(price=100)
+        ):
+            response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
+
+        self.assertEqual(response.status_code, 200)
+        monkey.refresh_from_db()
+        self.assertFalse(monkey.is_active)
+        self.assertIsNotNone(monkey.killed_at)
+        self.assertEqual(Holding.objects.get(monkey=monkey, stock=stock).quantity, 0)
+
+    def test_system_monkey_excluded_from_dashboard_and_monkey_list(self):
+        system_monkey = services.get_or_create_system_monkey()
+        Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+
+        list_response = self.client.get(reverse("monkey-list"))
+        self.assertNotIn(system_monkey.id, [item["id"] for item in list_response.data])
+
+        self.assertEqual(len(services._earning_ratios()), 1)
+
+        snapshot_result = services.snapshot_all_monkeys()
+        self.assertEqual(snapshot_result["snapshots"], 1)
+        self.assertFalse(
+            MonkeyDailySnapshot.objects.filter(monkey=system_monkey).exists()
+        )
 
     def test_public_can_read_global_control_and_admin_can_patch(self):
         response = self.client.get(reverse("global-monkey-control-current"))
