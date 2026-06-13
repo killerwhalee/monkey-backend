@@ -22,6 +22,17 @@ class Stock(models.Model):
         default=True,
         help_text="Whether this stock is currently listed on its market.",
     )
+    current_price = models.PositiveIntegerField(
+        "Current price",
+        null=True,
+        blank=True,
+        help_text="Latest live price from KIS; refreshed for held stocks during trading hours.",
+    )
+    price_updated_at = models.DateTimeField(
+        "Price updated at",
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         constraints = [
