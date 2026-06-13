@@ -114,3 +114,18 @@ class AccountSummaryView(views.APIView):
     def get(self, request):
         data = services.build_account_summary()
         return Response(serializers.AccountSummarySerializer(data).data)
+
+
+class CandlestickView(views.APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        unit = request.query_params.get("unit", "1d")
+        if unit not in services.CANDLE_UNIT_SECONDS:
+            unit = "1d"
+        try:
+            limit = min(int(request.query_params.get("limit", 120)), 1000)
+        except (TypeError, ValueError):
+            limit = 120
+        data = services.build_earning_ratio_candlesticks(unit=unit, limit=limit)
+        return Response(serializers.CandlestickSerializer(data, many=True).data)

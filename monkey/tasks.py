@@ -32,6 +32,14 @@ def run_monkey(monkey_id):
 
 
 @shared_task
+def check_holiday():
+    is_holiday = KisClient().is_holiday()
+    note = "휴장일 (자동)" if is_holiday else "영업일 (자동)"
+    services.set_holiday_closed(is_holiday, note=note)
+    return {"is_holiday": is_holiday}
+
+
+@shared_task
 def market_open():
     services.set_trading_enabled(True, note="장 시작 (자동)")
     return {"enabled": True}
@@ -62,3 +70,13 @@ def auto_create_monkeys():
 @shared_task
 def record_earning_ratio_tick():
     return services.record_earning_ratio_tick()
+
+
+@shared_task
+def update_held_stock_prices():
+    return services.update_held_stock_prices()
+
+
+@shared_task
+def reconcile_executions():
+    return services.reconcile_order_executions()

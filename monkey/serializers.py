@@ -29,7 +29,16 @@ class MonkeySerializer(serializers.ModelSerializer):
         holdings = Holding.objects.filter(monkey=obj, quantity__gt=0).select_related(
             "stock"
         )
-        return HoldingSerializer(holdings, many=True).data
+        breakdown = build_holdings_breakdown(obj)
+        data = HoldingSerializer(holdings, many=True).data
+        for row in data:
+            extra = breakdown.get(row["stock"]["id"], {})
+            row["average_price"] = extra.get("average_price", 0)
+            row["current_price"] = extra.get("current_price", 0)
+            row["evaluation"] = extra.get("evaluation", 0)
+            row["profit"] = extra.get("profit", 0)
+            row["profit_rate"] = extra.get("profit_rate", 0.0)
+        return data
 
     def get_recent_orders(self, obj):
         orders = (
@@ -52,16 +61,24 @@ class MonkeyBulkCreateSerializer(serializers.Serializer):
 
 
 class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
+    enabled = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = GlobalMonkeyControl
         fields = [
             "id",
             "enabled",
+            "time_enabled",
+            "holiday_enabled",
+            "manual_enabled",
             "kill_threshold",
             "note",
             "created_at",
             "updated_at",
         ]
+        # The time/holiday gates are owned by scheduled tasks; only the manual
+        # gate (and threshold/note) may be changed through the API.
+        read_only_fields = ["time_enabled", "holiday_enabled"]
 
 
 class KisAccessTokenSerializer(serializers.ModelSerializer):
@@ -96,8 +113,8 @@ class AccountSummarySerializer(serializers.Serializer):
     system_holdings_value = serializers.IntegerField()
 
 
-class EarningRatioCandlestickSerializer(serializers.Serializer):
-    date = serializers.DateField()
+class CandlestickSerializer(serializers.Serializer):
+    time = serializers.IntegerField()
     open = serializers.FloatField()
     high = serializers.FloatField()
     low = serializers.FloatField()
@@ -110,7 +127,6 @@ class DashboardSummarySerializer(serializers.Serializer):
     best_earning_ratio = serializers.FloatField()
     latest_orders = OrderSerializer(many=True)
     daily_earning_ratio_series = DailyEarningRatioPointSerializer(many=True)
-    candlestick_series = EarningRatioCandlestickSerializer(many=True)
 
 
 def build_monkey_metrics(monkey):
@@ -119,10 +135,10 @@ def build_monkey_metrics(monkey):
     realized_pl = 0
 
     for holding in Holding.objects.filter(monkey=monkey).select_related("stock"):
-        last_price = _latest_stock_price(monkey, holding.stock_id)
-        holdings_value += holding.quantity * last_price
-        basis, realized_for_stock = _stock_profit(monkey, holding.stock_id, last_price)
-        unrealized_pl += holding.quantity * last_price - basis
+        price = _current_price(monkey, holding.stock)
+        holdings_value += holding.quantity * price
+        basis, realized_for_stock = _stock_profit(monkey, holding.stock_id, price)
+        unrealized_pl += holding.quantity * price - basis
         realized_pl += realized_for_stock
 
     total_equity = monkey.balance + holdings_value
@@ -139,6 +155,40 @@ def build_monkey_metrics(monkey):
         "unrealized_pl": unrealized_pl,
         "earning_ratio": earning_ratio,
     }
+
+
+def build_holdings_breakdown(monkey):
+    """Per-held-stock average price, live price, evaluation and earning rate.
+
+    Keyed by ``stock_id``. Average price comes from FIFO-walking the monkey's
+    succeeded orders (handles repeated buys/sells); current price is the live
+    Stock price (falling back to the last trade price when not yet polled).
+    """
+    breakdown = {}
+    for holding in Holding.objects.filter(monkey=monkey, quantity__gt=0).select_related(
+        "stock"
+    ):
+        current_price = _current_price(monkey, holding.stock)
+        cost_basis, _ = _stock_profit(monkey, holding.stock_id, current_price)
+        average_price = round(cost_basis / holding.quantity) if holding.quantity else 0
+        evaluation = holding.quantity * current_price
+        profit = evaluation - cost_basis
+        profit_rate = (profit / cost_basis) if cost_basis else 0.0
+        breakdown[holding.stock_id] = {
+            "average_price": average_price,
+            "current_price": current_price,
+            "evaluation": evaluation,
+            "profit": profit,
+            "profit_rate": profit_rate,
+        }
+    return breakdown
+
+
+def _current_price(monkey, stock):
+    """Live price for a stock, falling back to the monkey's last trade price."""
+    if stock.current_price:
+        return stock.current_price
+    return _latest_stock_price(monkey, stock.id)
 
 
 def _latest_stock_price(monkey, stock_id):

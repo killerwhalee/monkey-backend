@@ -16,6 +16,12 @@ class KisClient:
     SELL_TR_ID = "VTTC0011U"
     PRICE_TR_ID = "FHKST01010100"
     BALANCE_TR_ID = "VTTC8434R"
+    HOLIDAY_TR_ID = "CTCA0903R"
+    DAILY_CCLD_TR_ID = "VTTC0081R"
+
+    # The holiday endpoint is not served on the virtual/paper domain
+    # (모의투자 미지원), so it is always queried against production.
+    HOLIDAY_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
     def __init__(self):
         self.base_url = settings.KIS_API_BASE_URL.rstrip("/")
@@ -104,6 +110,88 @@ class KisClient:
             },
         }
 
+    def is_holiday(self, date=None):
+        """Return True if the KRX market is closed on ``date`` (default: today).
+
+        Uses the domestic holiday endpoint (production-only). On any error we
+        assume the market is *open* (return False) so a transient failure never
+        silently halts trading — a wrong "open" just produces harmless rejected
+        orders, whereas a wrong "holiday" would freeze a real trading day.
+        """
+        target = date or timezone.localdate()
+        bass_dt = target.strftime("%Y%m%d")
+        try:
+            data = self._get(
+                "/uapi/domestic-stock/v1/quotations/chk-holiday",
+                self.HOLIDAY_TR_ID,
+                {"BASS_DT": bass_dt, "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
+                base_url=self.HOLIDAY_BASE_URL,
+            )
+        except (KisClientError, ValueError):
+            return False
+        for entry in data.get("output") or []:
+            if str(entry.get("bass_dt")) == bass_dt:
+                return str(entry.get("opnd_yn")).upper() != "Y"
+        return False
+
+    def get_daily_order_executions(self, start_date=None, end_date=None):
+        """Return executed quantity/avg price per KIS order number (ODNO).
+
+        Walks the 주식일별주문체결조회 endpoint (paginating with the continuation
+        keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int}}``
+        for orders with at least one fill. ODNO keys are stripped of leading
+        zeros so they match however the order was originally recorded.
+        """
+        today = timezone.localdate()
+        start = (start_date or today).strftime("%Y%m%d")
+        end = (end_date or today).strftime("%Y%m%d")
+
+        executions = {}
+        ctx_fk = ""
+        ctx_nk = ""
+        tr_cont = ""
+        for _ in range(50):  # hard cap so a malformed continuation can't loop forever
+            response = requests.get(
+                f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                headers={**self._headers(self.DAILY_CCLD_TR_ID), "tr_cont": tr_cont},
+                params={
+                    "CANO": self.account_number,
+                    "ACNT_PRDT_CD": self.account_product_code,
+                    "INQR_STRT_DT": start,
+                    "INQR_END_DT": end,
+                    "SLL_BUY_DVSN_CD": "00",
+                    "INQR_DVSN": "00",
+                    "PDNO": "",
+                    "CCLD_DVSN": "00",
+                    "ORD_GNO_BRNO": "",
+                    "ODNO": "",
+                    "INQR_DVSN_3": "00",
+                    "INQR_DVSN_1": "",
+                    "EXCG_ID_DVSN_CD": "KRX",
+                    "CTX_AREA_FK100": ctx_fk,
+                    "CTX_AREA_NK100": ctx_nk,
+                },
+            )
+            self._raise_for_response(response)
+            data = response.json()
+            for item in data.get("output1") or []:
+                odno = str(item.get("odno") or "").lstrip("0")
+                executed = int(item.get("tot_ccld_qty") or 0)
+                if not odno or executed <= 0:
+                    continue
+                executions[odno] = {
+                    "executed_quantity": executed,
+                    "avg_price": round(float(item.get("avg_prvs") or 0)),
+                }
+
+            tr_cont = response.headers.get("tr_cont", "")
+            if tr_cont not in ("F", "M"):
+                break
+            ctx_fk = data.get("ctx_area_fk100", "")
+            ctx_nk = data.get("ctx_area_nk100", "")
+
+        return executions
+
     def order_stock(self, order_type, ticker, quantity):
         from market.models import Order
 
@@ -136,9 +224,9 @@ class KisClient:
             "custtype": "P",
         }
 
-    def _get(self, path, tr_id, params):
+    def _get(self, path, tr_id, params, base_url=None):
         response = requests.get(
-            f"{self.base_url}{path}",
+            f"{base_url or self.base_url}{path}",
             headers=self._headers(tr_id),
             params=params,
         )

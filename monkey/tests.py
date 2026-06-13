@@ -16,7 +16,14 @@ from monkey.serializers import build_monkey_metrics
 
 class FakeKisClient:
     def __init__(
-        self, price=1000, response=None, fail_order=False, balance=0, holdings=None
+        self,
+        price=1000,
+        response=None,
+        fail_order=False,
+        balance=0,
+        holdings=None,
+        holiday=False,
+        executions=None,
     ):
         self.price = price
         self.response = response or {
@@ -28,12 +35,20 @@ class FakeKisClient:
         self.orders = []
         self.balance = balance
         self.holdings = holdings or {}
+        self.holiday = holiday
+        self.executions = executions or {}
 
     def get_stock_price(self, ticker):
         return self.price
 
     def get_account_balance(self):
         return {"cash_balance": self.balance, "holdings": self.holdings}
+
+    def is_holiday(self, date=None):
+        return self.holiday
+
+    def get_daily_order_executions(self, start_date=None, end_date=None):
+        return self.executions
 
     def order_stock(self, order_type, ticker, quantity):
         self.orders.append(
@@ -462,7 +477,9 @@ class MonkeyApiTests(APITestCase):
     def test_public_can_read_global_control_and_admin_can_patch(self):
         response = self.client.get(reverse("global-monkey-control-current"))
         self.assertEqual(response.status_code, 200)
+        # Default: manual + holiday gates open, time gate closed → not enabled.
         self.assertEqual(response.data["enabled"], False)
+        self.assertEqual(response.data["manual_enabled"], True)
 
         user = get_user_model().objects.create_user(
             username="admin",
@@ -470,14 +487,37 @@ class MonkeyApiTests(APITestCase):
             is_staff=True,
         )
         self.client.force_authenticate(user)
+
+        # Open the time gate (as the market-open task would).
+        services.set_trading_enabled(True)
+        get_after_time = self.client.get(reverse("global-monkey-control-current"))
+        self.assertEqual(get_after_time.data["enabled"], True)
+
+        # Admin closes the manual gate → trading disabled even with time gate open.
         patch_response = self.client.patch(
             reverse("global-monkey-control-current"),
-            {"enabled": True},
+            {"manual_enabled": False},
             format="json",
         )
-
         self.assertEqual(patch_response.status_code, 200)
-        self.assertEqual(patch_response.data["enabled"], True)
+        self.assertEqual(patch_response.data["manual_enabled"], False)
+        self.assertEqual(patch_response.data["enabled"], False)
+
+    def test_read_only_gates_cannot_be_patched(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        patch_response = self.client.patch(
+            reverse("global-monkey-control-current"),
+            {"time_enabled": True, "holiday_enabled": False},
+            format="json",
+        )
+        self.assertEqual(patch_response.status_code, 200)
+        control = services.get_global_control()
+        # System-managed gates ignore client input.
+        self.assertFalse(control.time_enabled)
+        self.assertTrue(control.holiday_enabled)
 
 
 class MonkeyDailySnapshotTests(TestCase):
@@ -586,6 +626,14 @@ class DashboardSummaryApiTests(APITestCase):
             )
             for _ in range(7)
         ]
+        # A failed order must never appear on the dashboard (success-only feed).
+        Order.objects.create(
+            monkey=active_monkey,
+            stock=self.stock,
+            order_type=Order.OrderTypeChoices.BUY,
+            status=Order.StatusChoices.FAILED,
+            requested_quantity=1,
+        )
         # auto_now_add timestamps may tie at high resolution; force distinct, deterministic
         # ordering so the "-created_at" comparison below isn't flaky
         base_time = timezone.now()
@@ -643,11 +691,15 @@ class DashboardSummaryApiTests(APITestCase):
         self.assertAlmostEqual(response.data["best_earning_ratio"], max(ratios))
 
         latest_orders = response.data["latest_orders"]
-        self.assertEqual(len(latest_orders), 5)
+        # Up to 10 succeeded orders, newest first; the failed order is excluded.
+        self.assertEqual(len(latest_orders), 7)
+        self.assertTrue(all(order["status"] == "succeeded" for order in latest_orders))
         self.assertEqual(
             [order["id"] for order in latest_orders],
             list(
-                Order.objects.order_by("-created_at").values_list("id", flat=True)[:5]
+                Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+                .order_by("-created_at")
+                .values_list("id", flat=True)[:10]
             ),
         )
 
@@ -718,3 +770,196 @@ class JWTAuthTests(APITestCase):
 
         self.assertEqual(refresh_response.status_code, 200)
         self.assertIn("access", refresh_response.data)
+
+
+class ThreeGateControlTests(TestCase):
+    def test_effective_enabled_is_and_of_all_gates(self):
+        control = services.get_global_control()
+        # Fresh control: time gate closed by default.
+        self.assertFalse(control.enabled)
+
+        control.time_enabled = True
+        control.holiday_enabled = True
+        control.manual_enabled = True
+        self.assertTrue(control.enabled)
+
+        for gate in ("time_enabled", "holiday_enabled", "manual_enabled"):
+            setattr(control, gate, False)
+            self.assertFalse(control.enabled, f"{gate} off should disable trading")
+            setattr(control, gate, True)
+
+    def test_set_trading_enabled_only_flips_time_gate(self):
+        services.set_holiday_closed(False)
+        services.set_trading_enabled(True)
+        control = services.get_global_control()
+        self.assertTrue(control.time_enabled)
+        self.assertTrue(control.holiday_enabled)
+        self.assertTrue(control.manual_enabled)
+
+    def test_set_holiday_closed_only_flips_holiday_gate(self):
+        services.set_trading_enabled(True)
+        services.set_holiday_closed(True)
+        control = services.get_global_control()
+        self.assertFalse(control.holiday_enabled)
+        self.assertTrue(control.time_enabled)
+        self.assertFalse(control.enabled)
+
+    def test_holiday_gate_short_circuits_run_active_monkeys(self):
+        services.set_trading_enabled(True)
+        services.set_holiday_closed(True)
+        result = services.run_active_monkeys()
+        self.assertEqual(result, {"enabled": False, "orders": 0})
+
+    def test_check_holiday_task_sets_holiday_gate(self):
+        with mock.patch(
+            "monkey.tasks.KisClient",
+            return_value=FakeKisClient(holiday=True),
+        ):
+            from monkey.tasks import check_holiday
+
+            check_holiday()
+        self.assertFalse(services.get_global_control().holiday_enabled)
+
+
+class HoldingsBreakdownTests(TestCase):
+    def setUp(self):
+        self.stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung Electronics"
+        )
+        self.monkey = Monkey.objects.create(
+            name="A", balance=1000, initial_balance=10000
+        )
+
+    def _buy(self, quantity, price, minutes_ago):
+        order = Order.objects.create(
+            monkey=self.monkey,
+            stock=self.stock,
+            order_type=Order.OrderTypeChoices.BUY,
+            status=Order.StatusChoices.SUCCEEDED,
+            requested_quantity=quantity,
+            executed_quantity=quantity,
+            estimated_price=price,
+            executed_price=price,
+        )
+        Order.objects.filter(pk=order.pk).update(
+            created_at=timezone.now() - timedelta(minutes=minutes_ago)
+        )
+        return order
+
+    def test_average_price_is_weighted_across_multiple_buys(self):
+        from monkey.serializers import build_holdings_breakdown
+
+        self._buy(2, 1000, minutes_ago=10)
+        self._buy(3, 2000, minutes_ago=5)
+        Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=5)
+        self.stock.current_price = 3000
+        self.stock.save(update_fields=["current_price"])
+
+        breakdown = build_holdings_breakdown(self.monkey)[self.stock.id]
+        # cost basis 2*1000 + 3*2000 = 8000 over 5 shares → avg 1600
+        self.assertEqual(breakdown["average_price"], 1600)
+        self.assertEqual(breakdown["current_price"], 3000)
+        self.assertEqual(breakdown["evaluation"], 15000)
+        self.assertEqual(breakdown["profit"], 7000)
+        self.assertAlmostEqual(breakdown["profit_rate"], 7000 / 8000)
+
+    def test_average_price_after_partial_sell(self):
+        from monkey.serializers import build_holdings_breakdown
+
+        self._buy(4, 1000, minutes_ago=10)
+        sell = Order.objects.create(
+            monkey=self.monkey,
+            stock=self.stock,
+            order_type=Order.OrderTypeChoices.SELL,
+            status=Order.StatusChoices.SUCCEEDED,
+            requested_quantity=1,
+            executed_quantity=1,
+            estimated_price=1500,
+            executed_price=1500,
+        )
+        Order.objects.filter(pk=sell.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+        Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=3)
+        self.stock.current_price = 1000
+        self.stock.save(update_fields=["current_price"])
+
+        breakdown = build_holdings_breakdown(self.monkey)[self.stock.id]
+        # Average stays 1000 after a partial sell at average cost.
+        self.assertEqual(breakdown["average_price"], 1000)
+
+    def test_update_held_stock_prices_writes_live_price(self):
+        Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=2)
+        services.set_trading_enabled(True)
+        result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
+        self.stock.refresh_from_db()
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(self.stock.current_price, 4321)
+        self.assertIsNotNone(self.stock.price_updated_at)
+
+    def test_update_held_stock_prices_gated_on_global_switch(self):
+        Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=2)
+        result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
+        self.assertEqual(result, {"enabled": False})
+
+
+class ExecutionReconciliationTests(TestCase):
+    def setUp(self):
+        self.stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung Electronics"
+        )
+        self.monkey = Monkey.objects.create(
+            name="A", balance=1000, initial_balance=10000
+        )
+        services.set_trading_enabled(True)
+
+    def test_reconcile_corrects_executed_price_and_quantity(self):
+        order = Order.objects.create(
+            monkey=self.monkey,
+            stock=self.stock,
+            order_type=Order.OrderTypeChoices.BUY,
+            status=Order.StatusChoices.SUCCEEDED,
+            requested_quantity=1,
+            executed_quantity=1,
+            estimated_price=1000,
+            executed_price=1000,
+            kis_order_id="0000012345",
+        )
+        client = FakeKisClient(
+            executions={"12345": {"executed_quantity": 1, "avg_price": 1050}}
+        )
+        result = services.reconcile_order_executions(kis_client=client)
+
+        order.refresh_from_db()
+        self.assertEqual(result["reconciled"], 1)
+        self.assertEqual(order.executed_price, 1050)
+
+    def test_reconcile_gated_on_global_switch(self):
+        services.set_trading_enabled(False)
+        result = services.reconcile_order_executions(kis_client=FakeKisClient())
+        self.assertEqual(result, {"enabled": False})
+
+
+class CandlestickApiTests(APITestCase):
+    def test_candlesticks_endpoint_is_public_and_buckets_by_unit(self):
+        from monkey.models import MonkeyEarningRatioTick
+
+        ticks = [
+            MonkeyEarningRatioTick.objects.create(average_earning_ratio=ratio)
+            for ratio in (0.1, 0.3, 0.2)
+        ]
+        base = timezone.now()
+        for offset, tick in enumerate(ticks):
+            MonkeyEarningRatioTick.objects.filter(pk=tick.pk).update(
+                recorded_at=base - timedelta(minutes=2 - offset)
+            )
+
+        response = self.client.get(reverse("candlesticks"), {"unit": "1d"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        candle = response.data[0]
+        self.assertEqual(candle["open"], 0.1)
+        self.assertEqual(candle["high"], 0.3)
+        self.assertEqual(candle["low"], 0.1)
+        self.assertEqual(candle["close"], 0.2)
+        self.assertIn("time", candle)

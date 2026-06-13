@@ -1,4 +1,5 @@
 import random
+from datetime import timedelta
 
 from django.db import transaction
 from django.db.models import Avg, Max, Sum
@@ -18,20 +19,27 @@ AUTO_CREATE_STARTING_BALANCE = 1_000_000
 
 
 def get_global_control():
-    control, _ = GlobalMonkeyControl.objects.get_or_create(
-        pk=1,
-        defaults={"enabled": False},
-    )
+    control, _ = GlobalMonkeyControl.objects.get_or_create(pk=1)
     return control
 
 
 def set_trading_enabled(enabled: bool, note: str = "") -> GlobalMonkeyControl:
-    """Set GlobalMonkeyControl.enabled. Used by market_open / market_close tasks."""
+    """Open/close the *time* gate. Used by market_open / market_close tasks."""
     control = get_global_control()
-    control.enabled = enabled
+    control.time_enabled = enabled
     if note:
         control.note = note
-    control.save(update_fields=["enabled", "note", "updated_at"])
+    control.save(update_fields=["time_enabled", "note", "updated_at"])
+    return control
+
+
+def set_holiday_closed(is_holiday: bool, note: str = "") -> GlobalMonkeyControl:
+    """Open/close the *holiday* gate. Used by the daily check_holiday task."""
+    control = get_global_control()
+    control.holiday_enabled = not is_holiday
+    if note:
+        control.note = note
+    control.save(update_fields=["holiday_enabled", "note", "updated_at"])
     return control
 
 
@@ -97,12 +105,12 @@ def build_dashboard_summary():
         "average_earning_ratio": (sum(ratios) / len(ratios)) if ratios else 0.0,
         "best_earning_ratio": max(ratios) if ratios else 0.0,
         "latest_orders": (
-            Order.objects.select_related("monkey", "stock")
+            Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+            .select_related("monkey", "stock")
             .exclude(monkey__is_system=True)
-            .order_by("-created_at")[:5]
+            .order_by("-created_at")[:10]
         ),
         "daily_earning_ratio_series": daily_series,
-        "candlestick_series": build_earning_ratio_candlesticks(),
     }
 
 
@@ -128,26 +136,121 @@ def record_earning_ratio_tick():
     return {"enabled": True, "tick_id": tick.id, "average_earning_ratio": average}
 
 
-def build_earning_ratio_candlesticks(days=30):
-    """Group per-minute earning-ratio ticks by day into OHLC candlesticks."""
-    by_date = {}
+CANDLE_UNIT_SECONDS = {
+    "1m": 60,
+    "15m": 900,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
+
+
+def build_earning_ratio_candlesticks(unit="1d", limit=120):
+    """Bucket per-minute earning-ratio ticks into OHLC candlesticks.
+
+    ``unit`` is one of ``CANDLE_UNIT_SECONDS``. Each candle's ``time`` is the
+    bucket-start as epoch seconds (what lightweight-charts expects). ``1d``
+    buckets align to the local trading day; intraday units floor the absolute
+    timestamp to the unit width.
+    """
+    seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
+    buckets = {}
     for recorded_at, ratio in MonkeyEarningRatioTick.objects.order_by(
         "recorded_at"
     ).values_list("recorded_at", "average_earning_ratio"):
-        date = timezone.localtime(recorded_at).date()
-        by_date.setdefault(date, []).append(ratio)
+        if unit == "1d":
+            local = timezone.localtime(recorded_at)
+            midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+            bucket = int(midnight.timestamp())
+        else:
+            ts = int(recorded_at.timestamp())
+            bucket = ts - (ts % seconds)
+        buckets.setdefault(bucket, []).append(ratio)
 
     candlesticks = [
         {
-            "date": date,
+            "time": bucket,
             "open": values[0],
             "high": max(values),
             "low": min(values),
             "close": values[-1],
         }
-        for date, values in sorted(by_date.items())
+        for bucket, values in sorted(buckets.items())
     ]
-    return candlesticks[-days:]
+    return candlesticks[-limit:]
+
+
+def update_held_stock_prices(kis_client=None):
+    """Refresh live prices for every stock currently held by any monkey.
+
+    Gated on the global switch like record_earning_ratio_tick so prices are only
+    polled during a live trading session. These prices feed holdings valuation,
+    average-price/earning-rate breakdowns, and equity metrics.
+    """
+    if not get_global_control().enabled:
+        return {"enabled": False}
+
+    kis_client = kis_client or KisClient()
+    stock_ids = list(
+        Holding.objects.filter(quantity__gt=0, stock__is_active=True)
+        .values_list("stock_id", flat=True)
+        .distinct()
+    )
+
+    now = timezone.now()
+    updated = 0
+    for stock in Stock.objects.filter(id__in=stock_ids):
+        try:
+            price = kis_client.get_stock_price(stock.ticker)
+        except (KisClientError, ValueError):
+            continue
+        stock.current_price = price
+        stock.price_updated_at = now
+        stock.save(update_fields=["current_price", "price_updated_at"])
+        updated += 1
+    return {"enabled": True, "updated": updated}
+
+
+def reconcile_order_executions(kis_client=None, lookback_days=1):
+    """Correct recently-succeeded orders with their real KIS fills.
+
+    Market orders fill at prices that differ from the pre-trade estimate we
+    optimistically recorded. This polls the daily order-execution inquiry and,
+    matching by KIS order number (ODNO), updates each order's executed quantity
+    and price so the FIFO average-price/earning-rate math reflects reality. Each
+    order maps to one ODNO, so multiple buys/sells reconcile independently.
+    """
+    if not get_global_control().enabled:
+        return {"enabled": False}
+
+    kis_client = kis_client or KisClient()
+    start = timezone.localdate() - timedelta(days=lookback_days)
+    executions = kis_client.get_daily_order_executions(start_date=start)
+    if not executions:
+        return {"reconciled": 0}
+
+    reconciled = 0
+    cutoff = timezone.now() - timedelta(days=lookback_days + 1)
+    orders = Order.objects.filter(
+        status=Order.StatusChoices.SUCCEEDED,
+        created_at__gte=cutoff,
+    ).exclude(kis_order_id="")
+    for order in orders:
+        fill = executions.get(order.kis_order_id.lstrip("0"))
+        if not fill:
+            continue
+        executed_quantity = fill["executed_quantity"]
+        avg_price = fill["avg_price"] or order.executed_price
+        if (
+            order.executed_quantity == executed_quantity
+            and order.executed_price == avg_price
+        ):
+            continue
+        order.executed_quantity = executed_quantity
+        order.executed_price = avg_price
+        order.save(update_fields=["executed_quantity", "executed_price", "updated_at"])
+        reconciled += 1
+    return {"reconciled": reconciled}
 
 
 def build_account_summary(kis_client=None):

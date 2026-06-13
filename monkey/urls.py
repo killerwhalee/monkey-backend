@@ -25,4 +25,9 @@ urlpatterns = router.urls + [
         viewsets.AccountSummaryView.as_view(),
         name="account-summary",
     ),
+    path(
+        "candlesticks/",
+        viewsets.CandlestickView.as_view(),
+        name="candlesticks",
+    ),
 ]

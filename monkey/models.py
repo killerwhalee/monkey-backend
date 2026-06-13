@@ -5,11 +5,32 @@ from django.db import OperationalError, ProgrammingError, models
 
 
 class GlobalMonkeyControl(models.Model):
-    """Global switch for autonomous monkey trading."""
+    """Global switch for autonomous monkey trading.
 
-    enabled = models.BooleanField(
-        "Is monkey trading enabled?",
+    Trading is allowed only when all three independent gates are open. The
+    effective ``enabled`` is their logical AND:
+
+    - ``time_enabled``  — managed by the ``market_open`` / ``market_close`` beat
+      tasks (09:00 on, 15:30 off).
+    - ``holiday_enabled`` — managed by the daily ``check_holiday`` task; turned
+      off on KRX holidays.
+    - ``manual_enabled`` — the admin kill-switch (the only admin-toggleable gate).
+    """
+
+    time_enabled = models.BooleanField(
+        "Time gate open?",
         default=False,
+        help_text="Open between market open (09:00) and close (15:30); set by scheduled tasks.",
+    )
+    holiday_enabled = models.BooleanField(
+        "Holiday gate open?",
+        default=True,
+        help_text="Closed on KRX holidays; set daily by the holiday-check task.",
+    )
+    manual_enabled = models.BooleanField(
+        "Manual gate open?",
+        default=True,
+        help_text="Admin kill-switch. Trading runs only when this and the other gates are all open.",
     )
     note = models.CharField(
         "Note",
@@ -29,6 +50,11 @@ class GlobalMonkeyControl(models.Model):
         "Updated at",
         auto_now=True,
     )
+
+    @property
+    def enabled(self) -> bool:
+        """Effective trading switch: every gate must be open."""
+        return self.time_enabled and self.holiday_enabled and self.manual_enabled
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] enabled={self.enabled}"
