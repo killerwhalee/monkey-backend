@@ -53,7 +53,7 @@ Restart your shell (or `source ~/.bashrc` / `~/.zshrc`) so `uv` is on `PATH`.
 
 ```bash
 git clone <repo-url> monkey
-cd monkey/01-backend
+cd monkey/backend
 ```
 
 ## 4. Install Python dependencies
@@ -67,7 +67,7 @@ django-celery-beat/results, etc.), including `dev` extras (pre-commit, isort).
 
 ## 5. Configure environment variables
 
-Create a `.env` file in `01-backend/` (this directory). It is loaded by `core/settings.py` via
+Create a `.env` file in `backend/` (this directory). It is loaded by `core/settings.py` via
 `django-environ` and is **never committed**.
 
 ```bash
