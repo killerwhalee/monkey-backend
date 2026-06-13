@@ -125,6 +125,13 @@ class DashboardSummarySerializer(serializers.Serializer):
     active_monkey_count = serializers.IntegerField()
     average_earning_ratio = serializers.FloatField()
     best_earning_ratio = serializers.FloatField()
+    total_initial_balance = serializers.IntegerField()
+    total_cash_balance = serializers.IntegerField()
+    total_holdings_value = serializers.IntegerField()
+    total_equity = serializers.IntegerField()
+    total_pl = serializers.IntegerField()
+    earning_ratio = serializers.FloatField()
+    average_order_interval_seconds = serializers.IntegerField()
     latest_orders = OrderSerializer(many=True)
     daily_earning_ratio_series = DailyEarningRatioPointSerializer(many=True)
 

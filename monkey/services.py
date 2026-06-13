@@ -87,7 +87,26 @@ def snapshot_all_monkeys(target_date=None):
 
 
 def build_dashboard_summary():
-    ratios = _earning_ratios()
+    from monkey.serializers import build_monkey_metrics
+
+    monkeys = list(Monkey.objects.filter(is_system=False))
+    metrics = [build_monkey_metrics(monkey) for monkey in monkeys]
+    ratios = [item["earning_ratio"] for item in metrics]
+
+    active_monkeys = [monkey for monkey in monkeys if monkey.is_active]
+    total_initial = sum(monkey.initial_balance for monkey in monkeys)
+    total_cash = sum(item["cash_balance"] for item in metrics)
+    total_holdings = sum(item["holdings_value"] for item in metrics)
+    total_equity = total_cash + total_holdings
+    total_pl = total_equity - total_initial
+    average_interval = (
+        round(
+            sum(monkey.order_interval_seconds for monkey in active_monkeys)
+            / len(active_monkeys)
+        )
+        if active_monkeys
+        else 0
+    )
 
     daily_series = list(
         MonkeyDailySnapshot.objects.values("date")
@@ -99,11 +118,16 @@ def build_dashboard_summary():
     )
 
     return {
-        "active_monkey_count": Monkey.objects.filter(
-            is_active=True, is_system=False
-        ).count(),
+        "active_monkey_count": len(active_monkeys),
         "average_earning_ratio": (sum(ratios) / len(ratios)) if ratios else 0.0,
         "best_earning_ratio": max(ratios) if ratios else 0.0,
+        "total_initial_balance": total_initial,
+        "total_cash_balance": total_cash,
+        "total_holdings_value": total_holdings,
+        "total_equity": total_equity,
+        "total_pl": total_pl,
+        "earning_ratio": (total_pl / total_initial) if total_initial else 0.0,
+        "average_order_interval_seconds": average_interval,
         "latest_orders": (
             Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
             .select_related("monkey", "stock")
