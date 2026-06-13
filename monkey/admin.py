@@ -10,8 +10,7 @@ class MonkeyAdmin(admin.ModelAdmin):
         "is_active",
         "balance",
         "initial_balance",
-        "min_quantity",
-        "max_quantity",
+        "order_interval_seconds",
         "killed_at",
     ]
     list_filter = ["is_active"]
@@ -25,7 +24,6 @@ class GlobalMonkeyControlAdmin(admin.ModelAdmin):
         "id",
         "enabled",
         "kill_threshold",
-        "order_interval_seconds",
         "note",
         "updated_at",
     ]

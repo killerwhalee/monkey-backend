@@ -46,3 +46,19 @@ def market_close():
 @shared_task
 def snapshot_monkeys():
     return services.snapshot_all_monkeys()
+
+
+@shared_task
+def liquidate_orphaned_holdings():
+    return services.liquidate_orphaned_holdings()
+
+
+@shared_task
+def auto_create_monkeys():
+    monkeys = services.auto_create_monkeys()
+    return {"created": [monkey.id for monkey in monkeys]}
+
+
+@shared_task
+def record_earning_ratio_tick():
+    return services.record_earning_ratio_tick()

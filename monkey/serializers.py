@@ -19,31 +19,11 @@ class MonkeySerializer(serializers.ModelSerializer):
             "is_active",
             "balance",
             "initial_balance",
-            "min_quantity",
-            "max_quantity",
+            "order_interval_seconds",
             "holdings",
             "recent_orders",
             "metrics",
         ]
-
-    def validate(self, attrs):
-        min_quantity = attrs.get(
-            "min_quantity", getattr(self.instance, "min_quantity", 1)
-        )
-        max_quantity = attrs.get(
-            "max_quantity", getattr(self.instance, "max_quantity", 1)
-        )
-        if min_quantity < 1:
-            raise serializers.ValidationError(
-                {"min_quantity": "Minimum quantity must be at least 1."}
-            )
-        if max_quantity < min_quantity:
-            raise serializers.ValidationError(
-                {
-                    "max_quantity": "Maximum quantity must be greater than or equal to minimum quantity."
-                }
-            )
-        return attrs
 
     def get_holdings(self, obj):
         holdings = Holding.objects.filter(monkey=obj, quantity__gt=0).select_related(
@@ -66,17 +46,6 @@ class MonkeySerializer(serializers.ModelSerializer):
 class MonkeyBulkCreateSerializer(serializers.Serializer):
     count = serializers.IntegerField(min_value=1, max_value=1000)
     starting_balance = serializers.IntegerField(min_value=0)
-    min_quantity = serializers.IntegerField(min_value=1, default=1)
-    max_quantity = serializers.IntegerField(min_value=1, default=1)
-
-    def validate(self, attrs):
-        if attrs["max_quantity"] < attrs["min_quantity"]:
-            raise serializers.ValidationError(
-                {
-                    "max_quantity": "Maximum quantity must be greater than or equal to minimum quantity."
-                }
-            )
-        return attrs
 
     def create(self, validated_data):
         return services.create_monkeys(**validated_data)
@@ -89,7 +58,6 @@ class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
             "id",
             "enabled",
             "kill_threshold",
-            "order_interval_seconds",
             "note",
             "created_at",
             "updated_at",
@@ -114,12 +82,35 @@ class DailyEarningRatioPointSerializer(serializers.Serializer):
     best_earning_ratio = serializers.FloatField()
 
 
+class AccountSummarySerializer(serializers.Serializer):
+    kis_cash_balance = serializers.IntegerField()
+    unallocated_cash = serializers.IntegerField()
+    monkey_count = serializers.IntegerField()
+    active_monkey_count = serializers.IntegerField()
+    total_monkey_balance = serializers.IntegerField()
+    total_holdings_value = serializers.IntegerField()
+    total_equity = serializers.IntegerField()
+    average_earning_ratio = serializers.FloatField()
+    best_earning_ratio = serializers.FloatField()
+    system_balance = serializers.IntegerField()
+    system_holdings_value = serializers.IntegerField()
+
+
+class EarningRatioCandlestickSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    open = serializers.FloatField()
+    high = serializers.FloatField()
+    low = serializers.FloatField()
+    close = serializers.FloatField()
+
+
 class DashboardSummarySerializer(serializers.Serializer):
     active_monkey_count = serializers.IntegerField()
     average_earning_ratio = serializers.FloatField()
     best_earning_ratio = serializers.FloatField()
     latest_orders = OrderSerializer(many=True)
     daily_earning_ratio_series = DailyEarningRatioPointSerializer(many=True)
+    candlestick_series = EarningRatioCandlestickSerializer(many=True)
 
 
 def build_monkey_metrics(monkey):

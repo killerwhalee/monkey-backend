@@ -14,7 +14,7 @@ class IsAdminOrReadOnly(permissions.BasePermission):
 
 
 class MonkeyViewSet(viewsets.ModelViewSet):
-    queryset = Monkey.objects.all().order_by("id")
+    queryset = Monkey.objects.filter(is_system=False).order_by("id")
     serializer_class = serializers.MonkeySerializer
     permission_classes = [IsAdminOrReadOnly]
 
@@ -32,6 +32,27 @@ class MonkeyViewSet(viewsets.ModelViewSet):
             serializers.MonkeySerializer(monkeys, many=True).data,
             status=status.HTTP_201_CREATED,
         )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAdminUser],
+        url_path="force-kill",
+    )
+    def force_kill(self, request, pk=None):
+        monkey = self.get_object()
+        services.kill_monkey(monkey)
+        return Response(self.get_serializer(monkey).data)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        permission_classes=[permissions.IsAdminUser],
+        url_path="auto-create",
+    )
+    def auto_create(self, request):
+        monkeys = services.auto_create_monkeys()
+        return Response(serializers.MonkeySerializer(monkeys, many=True).data)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -85,3 +106,11 @@ class DashboardSummaryView(views.APIView):
     def get(self, request):
         data = services.build_dashboard_summary()
         return Response(serializers.DashboardSummarySerializer(data).data)
+
+
+class AccountSummaryView(views.APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        data = services.build_account_summary()
+        return Response(serializers.AccountSummarySerializer(data).data)

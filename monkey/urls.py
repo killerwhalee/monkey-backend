@@ -20,4 +20,9 @@ urlpatterns = router.urls + [
         viewsets.DashboardSummaryView.as_view(),
         name="dashboard-summary",
     ),
+    path(
+        "account-summary/",
+        viewsets.AccountSummaryView.as_view(),
+        name="account-summary",
+    ),
 ]
