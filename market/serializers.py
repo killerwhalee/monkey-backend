@@ -11,6 +11,7 @@ class StockSerializer(serializers.ModelSerializer):
             "market",
             "ticker",
             "name",
+            "is_active",
         ]
 
 

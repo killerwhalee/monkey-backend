@@ -56,16 +56,30 @@ def update_market():
             all_stock_data.extend(download_and_parse_market(tmp_dir, market))
 
     # Convert to model instances
-    stock_instances = [models.Stock(**data) for data in all_stock_data]
+    stock_instances = [models.Stock(**data, is_active=True) for data in all_stock_data]
 
     # UPSERT based on the composite unique key
     models.Stock.objects.bulk_create(
         stock_instances,
         update_conflicts=True,
         unique_fields=["ticker", "market"],
-        update_fields=["name"],  # Fields to update on conflict
+        update_fields=["name", "is_active"],  # Fields to update on conflict
     )
+
+    # Tickers absent from the fresh download are no longer listed.
+    deactivated = 0
+    for market in MARKET_CONFIG:
+        market_name = market.upper()
+        listed_tickers = {
+            data["ticker"] for data in all_stock_data if data["market"] == market_name
+        }
+        deactivated += (
+            models.Stock.objects.filter(market=market_name, is_active=True)
+            .exclude(ticker__in=listed_tickers)
+            .update(is_active=False)
+        )
 
     return {
         "stocks": len(all_stock_data),
+        "deactivated": deactivated,
     }

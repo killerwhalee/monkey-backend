@@ -5,8 +5,8 @@ from . import models
 
 @admin.register(models.Stock)
 class StockAdmin(admin.ModelAdmin):
-    list_display = ["market", "ticker", "name"]
-    list_filter = ["market"]
+    list_display = ["market", "ticker", "name", "is_active"]
+    list_filter = ["market", "is_active"]
     search_fields = ["ticker", "name"]
 
 
