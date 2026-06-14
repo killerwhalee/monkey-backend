@@ -290,6 +290,8 @@ class MonkeyServiceTests(TestCase):
             self.assertTrue(60 <= monkey.order_interval_seconds <= 1800)
 
     def test_kill_monkey_liquidates_all_holdings(self):
+        services.set_trading_enabled(True)
+
         monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
         other_stock = Stock.objects.create(
             market="KOSPI", ticker="000660", name="SK Hynix"
@@ -317,6 +319,20 @@ class MonkeyServiceTests(TestCase):
             status=Order.StatusChoices.SUCCEEDED,
         )
         self.assertEqual(sell_orders.count(), 2)
+
+    def test_kill_monkey_rejected_when_trading_disabled(self):
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+
+        with self.assertRaises(services.KillNotAllowedError):
+            services.kill_monkey(monkey)
+
+        monkey.refresh_from_db()
+        self.assertTrue(monkey.is_active)
+        self.assertIsNone(monkey.killed_at)
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 2
+        )
 
     def test_auto_create_monkeys_uses_kis_cash_balance(self):
         Monkey.objects.create(name="A", balance=1_000_000, initial_balance=1_000_000)
@@ -452,6 +468,8 @@ class MonkeyApiTests(APITestCase):
         self.assertEqual(Monkey.objects.count(), 2)
 
     def test_force_kill_endpoint_requires_admin_and_liquidates(self):
+        services.set_trading_enabled(True)
+
         stock = Stock.objects.create(
             market="KOSPI", ticker="005930", name="Samsung Electronics"
         )
@@ -476,6 +494,22 @@ class MonkeyApiTests(APITestCase):
         self.assertFalse(monkey.is_active)
         self.assertIsNotNone(monkey.killed_at)
         self.assertEqual(Holding.objects.get(monkey=monkey, stock=stock).quantity, 0)
+
+    def test_force_kill_endpoint_rejected_when_trading_disabled(self):
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+
+        response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("detail", response.data)
+        monkey.refresh_from_db()
+        self.assertTrue(monkey.is_active)
+        self.assertIsNone(monkey.killed_at)
 
     def test_system_monkey_excluded_from_dashboard_and_monkey_list(self):
         system_monkey = services.get_or_create_system_monkey()

@@ -41,7 +41,10 @@ class MonkeyViewSet(viewsets.ModelViewSet):
     )
     def force_kill(self, request, pk=None):
         monkey = self.get_object()
-        services.kill_monkey(monkey)
+        try:
+            services.kill_monkey(monkey)
+        except services.KillNotAllowedError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(self.get_serializer(monkey).data)
 
     @action(

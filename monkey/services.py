@@ -43,12 +43,20 @@ def set_holiday_closed(is_holiday: bool, note: str = "") -> GlobalMonkeyControl:
     return control
 
 
+class KillNotAllowedError(Exception):
+    """Raised when a monkey can't be killed because its holdings can't be liquidated."""
+
+
 def kill_monkey(monkey: Monkey) -> Monkey:
     """
     Deactivate a monkey and liquidate all of its holdings. Single path for both
     auto-kill (maybe_kill_monkey) and admin force-kill.
     The Monkey.save() override will automatically sync PeriodicTask.enabled=False.
     """
+    if not get_global_control().enabled:
+        raise KillNotAllowedError(
+            "거래가 비활성화되어 있어 보유 종목을 매도할 수 없으므로 원숭이를 제거할 수 없습니다."
+        )
     liquidate_holdings_for_monkey(monkey)
     monkey.is_active = False
     monkey.killed_at = timezone.now()
