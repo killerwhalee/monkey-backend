@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     # user apps
     "market",
     "monkey",
+    "feedback",
 ]
 
 
@@ -189,6 +190,25 @@ KIS_TOKEN_REFRESH_MARGIN_SECONDS = env.int(
 )
 
 
+# Email
+
+EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+
+EMAIL_HOST = env("EMAIL_HOST", default="smtp-relay.brevo.com")
+
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="noreply@monkey.whalebeta.com")
+
+FEEDBACK_ADMIN_EMAIL = env("FEEDBACK_ADMIN_EMAIL", default="")
+
+
 # Django REST Framework
 
 REST_FRAMEWORK = {
@@ -198,6 +218,9 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
     ],
+    "DEFAULT_THROTTLE_RATES": {
+        "feedback-create": "5/hour",
+    },
 }
 
 
