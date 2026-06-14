@@ -648,9 +648,11 @@ def reconcile_holdings(kis_client=None):
 
 
 def liquidate_orphaned_holdings():
-    """Daily reconciliation: absorb/clamp real-vs-local mismatches and sell off
-    holdings of delisted stocks. Gated on the global kill switch, same as
-    run_active_monkeys()."""
+    """Daily reconciliation: absorb/clamp real-vs-local mismatches, sell off
+    holdings of delisted stocks, and finish liquidating killed (inactive)
+    monkeys whose holdings could not be sold while the market was closed.
+    Gated on the global kill switch, same as run_active_monkeys() — so a
+    force-kill requested after hours is carried out once the market re-opens."""
     if not get_global_control().enabled:
         return {"enabled": False}
 
@@ -670,8 +672,16 @@ def liquidate_orphaned_holdings():
         )
         delisted_orders += len(orders)
 
+    # Sweep killed monkeys that still hold stock (e.g. force-killed while the
+    # market was closed, so their sell orders had not gone through yet).
+    killed_orders = 0
+    for monkey in Monkey.objects.filter(is_active=False, is_system=False):
+        orders = liquidate_holdings_for_monkey(monkey, kis_client=kis_client)
+        killed_orders += len(orders)
+
     return {
         "enabled": True,
         "reconciliation": reconciliation,
         "delisted_orders": delisted_orders,
+        "killed_orders": killed_orders,
     }

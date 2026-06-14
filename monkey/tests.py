@@ -398,6 +398,24 @@ class OrphanedHoldingsTests(TestCase):
             Holding.objects.get(monkey=monkey, stock=delisted_stock).quantity, 0
         )
 
+    def test_liquidate_orphaned_holdings_sells_killed_monkey_holdings(self):
+        services.set_trading_enabled(True)
+
+        killed = Monkey.objects.create(
+            name="Z", balance=0, initial_balance=1000, is_active=False
+        )
+        Holding.objects.create(monkey=killed, stock=self.stock, quantity=3)
+
+        fake_client = FakeKisClient(price=100, holdings={"005930": 3})
+
+        with mock.patch("monkey.services.KisClient", return_value=fake_client):
+            result = services.liquidate_orphaned_holdings()
+
+        self.assertEqual(result["killed_orders"], 1)
+        self.assertEqual(
+            Holding.objects.get(monkey=killed, stock=self.stock).quantity, 0
+        )
+
 
 class MonkeyApiTests(APITestCase):
     def test_public_can_read_monkeys_but_not_bulk_create(self):
