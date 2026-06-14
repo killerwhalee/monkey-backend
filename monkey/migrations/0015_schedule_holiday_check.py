@@ -8,7 +8,7 @@ def create_schedule(apps, schema_editor):
     PeriodicTask = apps.get_model("django_celery_beat", "PeriodicTask")
 
     schedule, _ = CrontabSchedule.objects.get_or_create(
-        minute="30",
+        minute="00",
         hour="8",
         day_of_week="1-5",
         day_of_month="*",
