@@ -124,6 +124,10 @@ class Monkey(models.Model):
         null=True,
         blank=True,
     )
+    created_at = models.DateTimeField(
+        "Created at",
+        auto_now_add=True,
+    )
 
     def _periodic_task_name(self):
         return f"monkey.run.{self.pk}"
@@ -166,6 +170,22 @@ class Monkey(models.Model):
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] {self.name}"
+
+
+class MonkeyName(models.Model):
+    """A name in the pool used to name newly created monkeys."""
+
+    name = models.CharField(
+        "Name",
+        max_length=32,
+        unique=True,
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
 
 
 class MonkeyDailySnapshot(models.Model):

@@ -12,10 +12,17 @@ class MonkeyAdmin(admin.ModelAdmin):
         "initial_balance",
         "order_interval_seconds",
         "killed_at",
+        "created_at",
     ]
     list_filter = ["is_active"]
     search_fields = ["name"]
-    readonly_fields = ["killed_at"]
+    readonly_fields = ["killed_at", "created_at"]
+
+
+@admin.register(models.MonkeyName)
+class MonkeyNameAdmin(admin.ModelAdmin):
+    list_display = ["name"]
+    search_fields = ["name"]
 
 
 @admin.register(models.GlobalMonkeyControl)

@@ -497,7 +497,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         monkey.balance += total_price
         monkey.save(update_fields=["balance"])
         holding.quantity -= quantity
-        holding.save(update_fields=["quantity"])
+        _save_holding(holding)
 
     order.executed_quantity = quantity
     order.executed_price = estimated_price
@@ -515,6 +515,14 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         ]
     )
     return order
+
+
+def _save_holding(holding):
+    """Persist a holding's quantity, removing the row entirely once it hits zero."""
+    if holding.quantity <= 0:
+        holding.delete()
+    else:
+        holding.save(update_fields=["quantity"])
 
 
 def _fail_order(order, reason):
@@ -615,7 +623,7 @@ def _clamp_phantom_holdings(ticker, phantom_qty):
             break
         reduction = min(remaining, holding.quantity)
         holding.quantity -= reduction
-        holding.save(update_fields=["quantity"])
+        _save_holding(holding)
         remaining -= reduction
         affected.append({"holding_id": holding.id, "reduced_by": reduction})
 

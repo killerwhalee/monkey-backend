@@ -307,11 +307,11 @@ class MonkeyServiceTests(TestCase):
         monkey.refresh_from_db()
         self.assertFalse(monkey.is_active)
         self.assertIsNotNone(monkey.killed_at)
-        self.assertEqual(
-            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 0
+        self.assertFalse(
+            Holding.objects.filter(monkey=monkey, stock=self.stock).exists()
         )
-        self.assertEqual(
-            Holding.objects.get(monkey=monkey, stock=other_stock).quantity, 0
+        self.assertFalse(
+            Holding.objects.filter(monkey=monkey, stock=other_stock).exists()
         )
         sell_orders = Order.objects.filter(
             monkey=monkey,
@@ -364,8 +364,9 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(result["clamped"], [])
 
         system_monkey = Monkey.objects.get(is_system=True)
-        holding = Holding.objects.get(monkey=system_monkey, stock=self.stock)
-        self.assertEqual(holding.quantity, 0)
+        self.assertFalse(
+            Holding.objects.filter(monkey=system_monkey, stock=self.stock).exists()
+        )
 
         order = Order.objects.get(id=absorbed["order_ids"][0])
         self.assertEqual(order.order_type, Order.OrderTypeChoices.SELL)
@@ -410,8 +411,8 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(
             Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 2
         )
-        self.assertEqual(
-            Holding.objects.get(monkey=monkey, stock=delisted_stock).quantity, 0
+        self.assertFalse(
+            Holding.objects.filter(monkey=monkey, stock=delisted_stock).exists()
         )
 
     def test_liquidate_orphaned_holdings_sells_killed_monkey_holdings(self):
@@ -428,8 +429,8 @@ class OrphanedHoldingsTests(TestCase):
             result = services.liquidate_orphaned_holdings()
 
         self.assertEqual(result["killed_orders"], 1)
-        self.assertEqual(
-            Holding.objects.get(monkey=killed, stock=self.stock).quantity, 0
+        self.assertFalse(
+            Holding.objects.filter(monkey=killed, stock=self.stock).exists()
         )
 
 
@@ -493,7 +494,7 @@ class MonkeyApiTests(APITestCase):
         monkey.refresh_from_db()
         self.assertFalse(monkey.is_active)
         self.assertIsNotNone(monkey.killed_at)
-        self.assertEqual(Holding.objects.get(monkey=monkey, stock=stock).quantity, 0)
+        self.assertFalse(Holding.objects.filter(monkey=monkey, stock=stock).exists())
 
     def test_force_kill_endpoint_rejected_when_trading_disabled(self):
         monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)

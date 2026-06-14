@@ -1,59 +1,5 @@
 import random
 
-PET_NAMES = [
-    "Arthur",
-    "Bella",
-    "Bingo",
-    "Buddy",
-    "Charlie",
-    "Coco",
-    "Cooper",
-    "Daisy",
-    "Duke",
-    "Ellie",
-    "Felix",
-    "Ginger",
-    "Gizmo",
-    "Harley",
-    "Hazel",
-    "Jack",
-    "Jasper",
-    "Kiwi",
-    "Leo",
-    "Lily",
-    "Lucky",
-    "Lucy",
-    "Luna",
-    "Max",
-    "Maggie",
-    "Milo",
-    "Mochi",
-    "Molly",
-    "Nala",
-    "Nemo",
-    "Oliver",
-    "Oreo",
-    "Oscar",
-    "Penny",
-    "Pepper",
-    "Rex",
-    "Rocky",
-    "Romeo",
-    "Rosie",
-    "Ruby",
-    "Sadie",
-    "Sam",
-    "Shadow",
-    "Simba",
-    "Sophie",
-    "Stella",
-    "Teddy",
-    "Tiger",
-    "Toby",
-    "Zoe",
-    "Zeus",
-]
-
 _ROMAN_NUMERAL_TABLE = [
     (1000, "M"),
     (900, "CM"),
@@ -80,11 +26,11 @@ def _to_roman(n):
 
 
 def generate_monkey_name():
-    """Pick a random pet name, disambiguating duplicates with roman numerals
-    (e.g. the 6th "Arthur" becomes "Arthur VI")."""
-    from monkey.models import Monkey
+    """Pick a random name from the MonkeyName pool, disambiguating duplicates
+    with roman numerals (e.g. the 6th "Arthur" becomes "Arthur VI")."""
+    from monkey.models import Monkey, MonkeyName
 
-    base = random.choice(PET_NAMES)
+    base = random.choice(list(MonkeyName.objects.values_list("name", flat=True)))
     count = Monkey.objects.filter(name__startswith=base).count()
     if count == 0:
         return base

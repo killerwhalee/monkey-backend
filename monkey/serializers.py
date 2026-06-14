@@ -21,11 +21,12 @@ class MonkeySerializer(serializers.ModelSerializer):
             "initial_balance",
             "order_interval_seconds",
             "killed_at",
+            "created_at",
             "holdings",
             "recent_orders",
             "metrics",
         ]
-        read_only_fields = ["killed_at"]
+        read_only_fields = ["killed_at", "created_at"]
 
     def get_holdings(self, obj):
         holdings = Holding.objects.filter(monkey=obj, quantity__gt=0).select_related(
