@@ -86,6 +86,156 @@ def sync_monkey_periodic_tasks():
     return {"gate_open": gate_open, "active_monkey_tasks": enabled_count}
 
 
+class ScheduleNotFoundError(Exception):
+    """Raised when a requested PeriodicTask schedule doesn't exist."""
+
+
+class NotATimeScheduleError(Exception):
+    """Raised when trying to set a time on a non-crontab (interval) task."""
+
+
+def _crontab_hour_minute(crontab):
+    """Concrete (hour, minute) for a crontab, or (None, None) for ranges/wildcards."""
+    try:
+        return int(crontab.hour), int(crontab.minute)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _serialize_task_schedule(task):
+    from monkey.task_catalog import DESCRIPTION_BY_TASK_PATH, LABEL_BY_TASK_PATH
+
+    hour, minute = _crontab_hour_minute(task.crontab)
+    return {
+        "id": task.id,
+        "name": task.name,
+        "label": LABEL_BY_TASK_PATH.get(task.task, task.name),
+        "description": DESCRIPTION_BY_TASK_PATH.get(task.task, ""),
+        "task": task.task,
+        "hour": hour,
+        "minute": minute,
+        "enabled": task.enabled,
+    }
+
+
+def list_task_schedules():
+    """Crontab-scheduled (daily) tasks, ascending by time of day.
+
+    Interval-based tasks (per-monkey orders, market-hours price polling) have no
+    time of day, so they're excluded — only ``crontab`` schedules show here.
+    """
+    from django_celery_beat.models import PeriodicTask
+
+    rows = [
+        _serialize_task_schedule(task)
+        for task in PeriodicTask.objects.filter(crontab__isnull=False).select_related(
+            "crontab"
+        )
+    ]
+    # Ascending by scheduled time; any non-concrete time sorts last.
+    rows.sort(key=lambda r: (r["hour"] is None, r["hour"] or 0, r["minute"] or 0))
+    return rows
+
+
+def set_task_schedule(task_id, hour, minute):
+    """Repoint a crontab task to a new time of day (day-of-week etc. unchanged)."""
+    from django_celery_beat.models import CrontabSchedule, PeriodicTask
+
+    try:
+        task = PeriodicTask.objects.select_related("crontab").get(pk=task_id)
+    except PeriodicTask.DoesNotExist as exc:
+        raise ScheduleNotFoundError(str(task_id)) from exc
+    if task.crontab is None:
+        raise NotATimeScheduleError(task.name)
+
+    old = task.crontab
+    schedule, _ = CrontabSchedule.objects.get_or_create(
+        minute=str(minute),
+        hour=str(hour),
+        day_of_week=old.day_of_week,
+        day_of_month=old.day_of_month,
+        month_of_year=old.month_of_year,
+        timezone=old.timezone,
+    )
+    if schedule.pk != old.pk:
+        task.crontab = schedule
+        # save() fires the post_save signal beat watches, so it reloads.
+        task.save(update_fields=["crontab"])
+        # Drop the old schedule if nothing else references it.
+        if not PeriodicTask.objects.filter(crontab=old).exists():
+            old.delete()
+        logger.info(
+            "rescheduled %s to %02d:%02d KST", task.name, int(hour), int(minute)
+        )
+    return _serialize_task_schedule(task)
+
+
+# Per-monkey order tasks are interval-scheduled too, but they're managed per
+# monkey (not by an admin), so the interval table hides them.
+_PER_MONKEY_TASK = "monkey.tasks.run_monkey"
+
+
+def _serialize_interval_schedule(task):
+    from monkey.task_catalog import DESCRIPTION_BY_TASK_PATH, LABEL_BY_TASK_PATH
+
+    return {
+        "id": task.id,
+        "name": task.name,
+        "label": LABEL_BY_TASK_PATH.get(task.task, task.name),
+        "description": DESCRIPTION_BY_TASK_PATH.get(task.task, ""),
+        "task": task.task,
+        "every": task.interval.every if task.interval else None,
+        "period": task.interval.period if task.interval else None,
+        "enabled": task.enabled,
+    }
+
+
+def list_interval_schedules():
+    """System interval tasks (e.g. price polling, earning-ratio ticks).
+
+    Per-monkey order tasks are excluded — they're configured per monkey, not here.
+    """
+    from django_celery_beat.models import PeriodicTask
+
+    rows = [
+        _serialize_interval_schedule(task)
+        for task in PeriodicTask.objects.filter(interval__isnull=False)
+        .exclude(task=_PER_MONKEY_TASK)
+        .select_related("interval")
+    ]
+    rows.sort(key=lambda r: (r["every"] is None, r["every"] or 0))
+    return rows
+
+
+def set_interval_schedule(task_id, every):
+    """Change a system interval task's cadence (seconds), keeping its period."""
+    from django_celery_beat.models import IntervalSchedule, PeriodicTask
+
+    try:
+        task = PeriodicTask.objects.select_related("interval").get(pk=task_id)
+    except PeriodicTask.DoesNotExist as exc:
+        raise ScheduleNotFoundError(str(task_id)) from exc
+    if task.interval is None:
+        raise NotATimeScheduleError(task.name)
+    if task.task == _PER_MONKEY_TASK:
+        raise NotATimeScheduleError(task.name)
+
+    old = task.interval
+    interval, _ = IntervalSchedule.objects.get_or_create(
+        every=every,
+        period=old.period,
+    )
+    if interval.pk != old.pk:
+        task.interval = interval
+        # save() fires the post_save signal beat watches, so it reloads.
+        task.save(update_fields=["interval"])
+        # Drop the old interval if nothing else references it.
+        if not PeriodicTask.objects.filter(interval=old).exists():
+            old.delete()
+        logger.info("rescheduled %s to every %ss", task.name, every)
+    return _serialize_interval_schedule(task)
+
+
 class KillNotAllowedError(Exception):
     """Raised when a monkey can't be killed because its holdings can't be liquidated."""
 

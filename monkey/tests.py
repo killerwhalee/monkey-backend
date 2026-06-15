@@ -578,6 +578,215 @@ class MonkeyApiTests(APITestCase):
         self.assertFalse(control.time_enabled)
         self.assertTrue(control.holiday_enabled)
 
+    def test_task_catalog_requires_staff(self):
+        non_staff = get_user_model().objects.create_user(
+            username="viewer", password="pw"
+        )
+        self.client.force_authenticate(non_staff)
+        response = self.client.get(reverse("global-monkey-control-tasks"))
+        self.assertEqual(response.status_code, 403)
+
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        response = self.client.get(reverse("global-monkey-control-tasks"))
+        self.assertEqual(response.status_code, 200)
+        names = {entry["name"] for entry in response.data}
+        self.assertIn("run_monkeys", names)
+        # Every entry carries a Korean label + description for the UI.
+        self.assertTrue(
+            all(entry["label"] and entry["description"] for entry in response.data)
+        )
+        # Dangerous tasks expose a non-empty warnings list; safe ones don't.
+        by_name = {entry["name"]: entry for entry in response.data}
+        self.assertTrue(by_name["run_monkeys"]["dangerous"])
+        self.assertTrue(len(by_name["run_monkeys"]["warnings"]) >= 1)
+        self.assertEqual(by_name["run_monkeys"]["task"], "monkey.tasks.run_monkeys")
+        self.assertFalse(by_name["snapshot_monkeys"]["dangerous"])
+        self.assertEqual(by_name["snapshot_monkeys"]["warnings"], [])
+
+    def test_run_task_enqueues_known_task(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        with mock.patch("monkey.task_catalog.monkey_tasks.run_monkeys.delay") as delay:
+            delay.return_value = mock.Mock(id="abc-123")
+            response = self.client.post(
+                reverse("global-monkey-control-run-task"),
+                {"task": "run_monkeys"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"task": "run_monkeys", "id": "abc-123"})
+        delay.assert_called_once_with()
+
+    def test_run_task_rejects_unknown_task(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        response = self.client.post(
+            reverse("global-monkey-control-run-task"),
+            {"task": "drop_database"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_run_task_requires_staff(self):
+        non_staff = get_user_model().objects.create_user(
+            username="viewer", password="pw"
+        )
+        self.client.force_authenticate(non_staff)
+        response = self.client.post(
+            reverse("global-monkey-control-run-task"),
+            {"task": "run_monkeys"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+
+class TaskScheduleApiTests(APITestCase):
+    """The migrations seed the crontab + interval PeriodicTasks we test against."""
+
+    def setUp(self):
+        from django_celery_beat.models import PeriodicTask
+
+        self.check_holiday = PeriodicTask.objects.get(name="monkey.check_holiday")
+        self.check_holiday.crontab.day_of_week = "1-5"
+        self.check_holiday.crontab.save()
+        self.admin = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+
+    def test_schedules_list_is_crontab_only_and_time_sorted(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(reverse("global-monkey-control-schedules"))
+        self.assertEqual(response.status_code, 200)
+        names = [row["name"] for row in response.data]
+        # The interval-scheduled price poll is not a time-of-day task → excluded.
+        self.assertNotIn("monkey.update_held_stock_prices", names)
+        self.assertIn("monkey.check_holiday", names)
+        # Ascending by time of day.
+        times = [(row["hour"], row["minute"]) for row in response.data]
+        self.assertEqual(times, sorted(times))
+        # Korean label resolved from the task path.
+        holiday = next(r for r in response.data if r["name"] == "monkey.check_holiday")
+        self.assertEqual(holiday["label"], "휴장일 확인")
+        self.assertEqual((holiday["hour"], holiday["minute"]), (8, 0))
+
+    def test_schedules_require_staff(self):
+        viewer = get_user_model().objects.create_user(username="viewer", password="pw")
+        self.client.force_authenticate(viewer)
+        response = self.client.get(reverse("global-monkey-control-schedules"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_update_schedule_changes_time_and_keeps_day_of_week(self):
+        from django_celery_beat.models import PeriodicTask
+
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-schedule"),
+            {"id": self.check_holiday.id, "hour": 7, "minute": 30},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["hour"], 7)
+        self.assertEqual(response.data["minute"], 30)
+        task = PeriodicTask.objects.get(pk=self.check_holiday.id)
+        self.assertEqual(task.crontab.hour, "7")
+        self.assertEqual(task.crontab.minute, "30")
+        # Day-of-week is preserved across the reschedule.
+        self.assertEqual(task.crontab.day_of_week, "1-5")
+
+    def test_update_schedule_rejects_out_of_range_time(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-schedule"),
+            {"id": self.check_holiday.id, "hour": 25, "minute": 0},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_update_schedule_unknown_id_returns_404(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-schedule"),
+            {"id": 999999, "hour": 9, "minute": 0},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_interval_schedules_exclude_per_monkey_tasks(self):
+        from django_celery_beat.models import IntervalSchedule, PeriodicTask
+
+        # A per-monkey order task (interval-scheduled) must not appear.
+        interval, _ = IntervalSchedule.objects.get_or_create(every=90, period="seconds")
+        PeriodicTask.objects.create(
+            name="monkey.run.999",
+            task="monkey.tasks.run_monkey",
+            interval=interval,
+        )
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(reverse("global-monkey-control-interval-schedules"))
+        self.assertEqual(response.status_code, 200)
+        names = [row["name"] for row in response.data]
+        self.assertNotIn("monkey.run.999", names)
+        self.assertIn("monkey.update_held_stock_prices", names)
+        self.assertIn("monkey.earning_ratio_tick", names)
+        # Ascending by cadence.
+        everys = [row["every"] for row in response.data]
+        self.assertEqual(everys, sorted(everys))
+        price = next(
+            r for r in response.data if r["name"] == "monkey.update_held_stock_prices"
+        )
+        self.assertEqual(price["label"], "보유 종목 시세 갱신")
+
+    def test_update_interval_changes_cadence(self):
+        from django_celery_beat.models import PeriodicTask
+
+        price = PeriodicTask.objects.get(name="monkey.update_held_stock_prices")
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-interval"),
+            {"id": price.id, "every": 300},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["every"], 300)
+        price.refresh_from_db()
+        self.assertEqual(price.interval.every, 300)
+
+    def test_update_interval_rejects_per_monkey_task(self):
+        from django_celery_beat.models import IntervalSchedule, PeriodicTask
+
+        interval, _ = IntervalSchedule.objects.get_or_create(every=90, period="seconds")
+        run_task = PeriodicTask.objects.create(
+            name="monkey.run.123",
+            task="monkey.tasks.run_monkey",
+            interval=interval,
+        )
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-interval"),
+            {"id": run_task.id, "every": 300},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_update_interval_rejects_out_of_range(self):
+        from django_celery_beat.models import PeriodicTask
+
+        price = PeriodicTask.objects.get(name="monkey.update_held_stock_prices")
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("global-monkey-control-update-interval"),
+            {"id": price.id, "every": 99999},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
 
 class MonkeyDailySnapshotTests(TestCase):
     def setUp(self):

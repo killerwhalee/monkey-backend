@@ -66,6 +66,17 @@ class MonkeyBulkCreateSerializer(serializers.Serializer):
         return services.create_monkeys_checked(**validated_data)
 
 
+class TaskScheduleUpdateSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    hour = serializers.IntegerField(min_value=0, max_value=23)
+    minute = serializers.IntegerField(min_value=0, max_value=59)
+
+
+class IntervalScheduleUpdateSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    every = serializers.IntegerField(min_value=5, max_value=3600)
+
+
 class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
     enabled = serializers.BooleanField(read_only=True)
 
