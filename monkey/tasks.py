@@ -36,18 +36,21 @@ def check_holiday():
     is_holiday = KisClient().is_holiday()
     note = "휴장일 (자동)" if is_holiday else "영업일 (자동)"
     services.set_holiday_closed(is_holiday, note=note)
+    services.sync_monkey_periodic_tasks()
     return {"is_holiday": is_holiday}
 
 
 @shared_task
 def market_open():
     services.set_trading_enabled(True, note="장 시작 (자동)")
+    services.sync_monkey_periodic_tasks()
     return {"enabled": True}
 
 
 @shared_task
 def market_close():
     services.set_trading_enabled(False, note="장 마감 (자동)")
+    services.sync_monkey_periodic_tasks()
     return {"enabled": False}
 
 

@@ -66,9 +66,11 @@ class FakeKisClient:
 
 
 class FakeResponse:
-    def __init__(self, data, status_ok=True):
+    def __init__(self, data, status_ok=True, status_code=200, headers=None):
         self.data = data
         self.status_ok = status_ok
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if not self.status_ok:
@@ -419,7 +421,7 @@ class OrphanedHoldingsTests(TestCase):
         services.set_trading_enabled(True)
 
         killed = Monkey.objects.create(
-            name="Z", balance=0, initial_balance=1000, is_active=False
+            name="Z", balance=0, initial_balance=1000, state=Monkey.State.DEAD
         )
         Holding.objects.create(monkey=killed, stock=self.stock, quantity=3)
 
@@ -456,14 +458,18 @@ class MonkeyApiTests(APITestCase):
         )
         self.client.force_authenticate(user)
 
-        response = self.client.post(
-            reverse("monkey-bulk-create"),
-            {
-                "count": 2,
-                "starting_balance": 1000,
-            },
-            format="json",
-        )
+        with mock.patch(
+            "monkey.services.KisClient",
+            return_value=FakeKisClient(balance=1_000_000),
+        ):
+            response = self.client.post(
+                reverse("monkey-bulk-create"),
+                {
+                    "count": 2,
+                    "starting_balance": 1000,
+                },
+                format="json",
+            )
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Monkey.objects.count(), 2)
@@ -660,10 +666,10 @@ class DashboardSummaryApiTests(APITestCase):
 
     def test_dashboard_summary_shape_and_values(self):
         active_monkey = Monkey.objects.create(
-            name="A", balance=6000, initial_balance=5000, is_active=True
+            name="A", balance=6000, initial_balance=5000, state=Monkey.State.ACTIVE
         )
         paused_monkey = Monkey.objects.create(
-            name="B", balance=4000, initial_balance=5000, is_active=False
+            name="B", balance=4000, initial_balance=5000, state=Monkey.State.INACTIVE
         )
 
         orders = [
@@ -1016,3 +1022,155 @@ class CandlestickApiTests(APITestCase):
         self.assertEqual(candle["low"], 0.1)
         self.assertEqual(candle["close"], 0.2)
         self.assertIn("time", candle)
+
+    def test_intraday_buckets_are_shifted_to_kst(self):
+        from monkey.models import MonkeyEarningRatioTick
+
+        tick = MonkeyEarningRatioTick.objects.create(average_earning_ratio=0.1)
+        known = timezone.now().replace(microsecond=0)
+        MonkeyEarningRatioTick.objects.filter(pk=tick.pk).update(recorded_at=known)
+
+        candles = services.build_earning_ratio_candlesticks(unit="1m")
+
+        shifted = int(known.timestamp()) + services.KST_OFFSET_SECONDS
+        expected = shifted - (shifted % 60)
+        self.assertEqual(candles[-1]["time"], expected)
+
+
+class MonkeyStateLifecycleTests(TestCase):
+    def _task(self, monkey):
+        from django_celery_beat.models import PeriodicTask
+
+        return PeriodicTask.objects.filter(name=f"monkey.run.{monkey.id}").first()
+
+    def test_active_monkey_task_disabled_while_gate_closed(self):
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        task = self._task(monkey)
+        self.assertIsNotNone(task)
+        self.assertFalse(task.enabled)  # default gate (time) is closed
+        self.assertEqual(task.expire_seconds, min(monkey.order_interval_seconds, 120))
+
+    def test_active_monkey_task_enabled_when_created_with_gate_open(self):
+        services.set_trading_enabled(True)
+        services.set_holiday_closed(False)
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        self.assertTrue(self._task(monkey).enabled)
+
+    def test_killing_monkey_deletes_its_task(self):
+        services.set_trading_enabled(True)
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        self.assertIsNotNone(self._task(monkey))
+
+        with mock.patch(
+            "monkey.services.KisClient", return_value=FakeKisClient(price=100)
+        ):
+            services.kill_monkey(monkey)
+
+        monkey.refresh_from_db()
+        self.assertEqual(monkey.state, Monkey.State.DEAD)
+        self.assertIsNone(self._task(monkey))
+
+    def test_sync_enables_active_disables_inactive(self):
+        active = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        paused = Monkey.objects.create(name="B", balance=1000, initial_balance=1000)
+        paused.state = Monkey.State.INACTIVE
+        paused.save(update_fields=["state"])
+
+        services.set_trading_enabled(True)
+        services.set_holiday_closed(False)
+        services.sync_monkey_periodic_tasks()
+
+        self.assertTrue(self._task(active).enabled)
+        self.assertFalse(self._task(paused).enabled)
+
+        services.set_trading_enabled(False)
+        services.sync_monkey_periodic_tasks()
+        self.assertFalse(self._task(active).enabled)
+
+
+class CashAllocationTests(TestCase):
+    def test_unallocated_cash_excludes_dead_monkeys(self):
+        Monkey.objects.create(
+            name="alive", balance=1_000_000, initial_balance=1_000_000
+        )
+        Monkey.objects.create(
+            name="dead",
+            balance=1_000_000,
+            initial_balance=1_000_000,
+            state=Monkey.State.DEAD,
+        )
+        client = FakeKisClient(balance=3_000_000)
+
+        self.assertEqual(services.unallocated_cash(kis_client=client), 2_000_000)
+
+    def test_create_monkeys_checked_rejects_when_insufficient(self):
+        client = FakeKisClient(balance=500)
+        with self.assertRaises(services.InsufficientCashError):
+            services.create_monkeys_checked(
+                count=1, starting_balance=1000, kis_client=client
+            )
+        self.assertEqual(Monkey.objects.count(), 0)
+
+
+class CachedPriceOrderTests(TestCase):
+    def test_buy_uses_cached_price_without_live_fetch(self):
+        stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung", current_price=1234
+        )
+        monkey = Monkey.objects.create(name="A", balance=5000, initial_balance=5000)
+
+        class NoFetchClient(FakeKisClient):
+            def get_stock_price(self, ticker):
+                raise AssertionError("should not fetch live price when cached exists")
+
+        order = services.submit_monkey_order(
+            monkey.id,
+            stock.id,
+            Order.OrderTypeChoices.BUY,
+            1,
+            kis_client=NoFetchClient(),
+        )
+
+        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.executed_price, 1234)
+
+
+class KisTransientRetryTests(TestCase):
+    def setUp(self):
+        KisAccessToken.objects.create(
+            environment="virtual",
+            token="seed",
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+    @mock.patch("monkey.kis.requests.post")
+    def test_retries_on_server_error_then_succeeds(self, post):
+        post.side_effect = [
+            FakeResponse({}, status_code=500),
+            FakeResponse({"access_token": "t-ok", "expires_in": 3600}),
+        ]
+        token = KisClient().refresh_access_token()
+        self.assertEqual(token.token, "t-ok")
+        self.assertEqual(post.call_count, 2)
+
+    @mock.patch("monkey.kis.requests.post")
+    def test_retries_on_rate_limit_message(self, post):
+        post.side_effect = [
+            FakeResponse(
+                {"msg1": "초당 거래건수를 초과하였습니다.", "msg_cd": "EGW00201"}
+            ),
+            FakeResponse({"access_token": "t-ok", "expires_in": 3600}),
+        ]
+        token = KisClient().refresh_access_token()
+        self.assertEqual(token.token, "t-ok")
+        self.assertEqual(post.call_count, 2)
+
+    @mock.patch("monkey.kis.requests.post")
+    def test_raises_after_exhausting_retries(self, post):
+        post.return_value = FakeResponse({}, status_code=500)
+        from monkey.kis import KisClientError
+
+        with self.assertRaises(KisClientError):
+            KisClient().refresh_access_token()
+        # KIS_MAX_RETRIES (3) + 1 initial attempt
+        self.assertEqual(post.call_count, 4)

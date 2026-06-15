@@ -27,7 +27,7 @@ class UpdateMarketTests(TestCase):
         with mock.patch(
             "market.tasks.download_and_parse_market", side_effect=_fake_download
         ):
-            result = tasks.update_market()
+            result = tasks.update_market()["output"]
 
         delisted.refresh_from_db()
         self.assertFalse(delisted.is_active)

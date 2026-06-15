@@ -27,7 +27,10 @@ class MonkeyViewSet(viewsets.ModelViewSet):
     def bulk_create(self, request):
         serializer = serializers.MonkeyBulkCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        monkeys = serializer.save()
+        try:
+            monkeys = serializer.save()
+        except services.InsufficientCashError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(
             serializers.MonkeySerializer(monkeys, many=True).data,
             status=status.HTTP_201_CREATED,

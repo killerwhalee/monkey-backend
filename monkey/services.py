@@ -1,7 +1,9 @@
+import logging
 import random
+import time
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.db.models import Avg, Max, Sum
 from django.utils import timezone
 
@@ -15,7 +17,13 @@ from monkey.models import (
 )
 from monkey.names import generate_monkey_name
 
+logger = logging.getLogger(__name__)
+
 AUTO_CREATE_STARTING_BALANCE = 1_000_000
+
+
+class InsufficientCashError(Exception):
+    """Raised when there isn't enough unallocated KIS cash to create monkeys."""
 
 
 def get_global_control():
@@ -43,6 +51,41 @@ def set_holiday_closed(is_holiday: bool, note: str = "") -> GlobalMonkeyControl:
     return control
 
 
+def sync_monkey_periodic_tasks():
+    """Enable/disable scheduled tasks to match the trading gate.
+
+    Called at market open/close and after the holiday check so beat stops
+    enqueuing per-monkey orders (and market-hours price polling) outside trading
+    hours — which is what crowded the queue post-market. Only ACTIVE monkeys'
+    tasks are (re-)enabled; INACTIVE stay paused and DEAD have no task.
+    """
+    from django_celery_beat.models import PeriodicTask, PeriodicTasks
+
+    gate_open = get_global_control().enabled
+    active_names = {
+        f"monkey.run.{pk}"
+        for pk in Monkey.objects.filter(state=Monkey.State.ACTIVE).values_list(
+            "pk", flat=True
+        )
+    }
+
+    enabled_count = 0
+    for task in PeriodicTask.objects.filter(task="monkey.tasks.run_monkey"):
+        desired = gate_open and task.name in active_names
+        if task.enabled != desired:
+            PeriodicTask.objects.filter(pk=task.pk).update(enabled=desired)
+        enabled_count += int(desired)
+
+    # Market-hours maintenance polling follows the gate too.
+    PeriodicTask.objects.filter(name="monkey.update_held_stock_prices").update(
+        enabled=gate_open
+    )
+
+    # Bulk .update() bypasses the post_save signal beat listens on — nudge it.
+    PeriodicTasks.update_changed()
+    return {"gate_open": gate_open, "active_monkey_tasks": enabled_count}
+
+
 class KillNotAllowedError(Exception):
     """Raised when a monkey can't be killed because its holdings can't be liquidated."""
 
@@ -58,9 +101,9 @@ def kill_monkey(monkey: Monkey) -> Monkey:
             "거래가 비활성화되어 있어 보유 종목을 매도할 수 없으므로 원숭이를 제거할 수 없습니다."
         )
     liquidate_holdings_for_monkey(monkey)
-    monkey.is_active = False
+    monkey.state = Monkey.State.DEAD
     monkey.killed_at = timezone.now()
-    monkey.save(update_fields=["is_active", "killed_at"])
+    monkey.save(update_fields=["state", "killed_at"])
     return monkey
 
 
@@ -176,6 +219,11 @@ CANDLE_UNIT_SECONDS = {
     "1d": 86400,
 }
 
+# lightweight-charts renders UTCTimestamp in UTC; KRX runs in KST (a constant
+# +9h, no DST), so we offset bucket times to make the chart show Seoul
+# wall-clock (e.g. the 09:00 open appears at 09:00, not 00:00).
+KST_OFFSET_SECONDS = 9 * 3600
+
 
 def build_earning_ratio_candlesticks(unit="1d", limit=120):
     """Bucket per-minute earning-ratio ticks into OHLC candlesticks.
@@ -193,9 +241,9 @@ def build_earning_ratio_candlesticks(unit="1d", limit=120):
         if unit == "1d":
             local = timezone.localtime(recorded_at)
             midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
-            bucket = int(midnight.timestamp())
+            bucket = int(midnight.timestamp()) + KST_OFFSET_SECONDS
         else:
-            ts = int(recorded_at.timestamp())
+            ts = int(recorded_at.timestamp()) + KST_OFFSET_SECONDS
             bucket = ts - (ts % seconds)
         buckets.setdefault(bucket, []).append(ratio)
 
@@ -316,6 +364,23 @@ def build_account_summary(kis_client=None):
     }
 
 
+def unallocated_cash(kis_client=None):
+    """KIS account cash not yet allocated to a *living* monkey.
+
+    Dead monkeys keep their ``balance`` (for the future gravestone view) but are
+    excluded here, so their cash is freed back into circulation for new monkeys.
+    """
+    kis_client = kis_client or KisClient()
+    kis_cash = kis_client.get_account_balance()["cash_balance"]
+    allocated = (
+        Monkey.objects.filter(is_system=False)
+        .exclude(state=Monkey.State.DEAD)
+        .aggregate(total=Sum("balance"))["total"]
+        or 0
+    )
+    return kis_cash - allocated
+
+
 def create_monkeys(count, starting_balance):
     # Individual saves (not bulk_create) so Monkey.save() fires and creates PeriodicTasks.
     monkeys = []
@@ -331,16 +396,26 @@ def create_monkeys(count, starting_balance):
     return monkeys
 
 
+def create_monkeys_checked(count, starting_balance, kis_client=None):
+    """Create monkeys only if the KIS account has enough unallocated cash.
+
+    Used by the admin bulk-create path; raises ``InsufficientCashError`` instead
+    of silently over-allocating beyond the real account balance.
+    """
+    available = unallocated_cash(kis_client=kis_client)
+    needed = count * starting_balance
+    if needed > available:
+        raise InsufficientCashError(
+            f"미배정 잔고가 부족합니다. 필요: {needed:,}원, 가용: {available:,}원."
+        )
+    return create_monkeys(count=count, starting_balance=starting_balance)
+
+
 def auto_create_monkeys(kis_client=None):
     """Create as many new monkeys as the KIS account's unallocated cash affords."""
     kis_client = kis_client or KisClient()
-    kis_cash = kis_client.get_account_balance()["cash_balance"]
-    allocated = (
-        Monkey.objects.filter(is_system=False).aggregate(total=Sum("balance"))["total"]
-        or 0
-    )
-    unallocated = kis_cash - allocated
-    count = unallocated // AUTO_CREATE_STARTING_BALANCE
+    available = unallocated_cash(kis_client=kis_client)
+    count = available // AUTO_CREATE_STARTING_BALANCE
     if count <= 0:
         return []
     return create_monkeys(count=count, starting_balance=AUTO_CREATE_STARTING_BALANCE)
@@ -351,8 +426,12 @@ def run_active_monkeys():
         return {"enabled": False, "orders": 0}
 
     orders = []
-    for monkey in Monkey.objects.filter(is_active=True).order_by("id"):
-        orders.append(run_random_monkey_order(monkey.id))
+    for monkey in Monkey.objects.filter(state=Monkey.State.ACTIVE).order_by("id"):
+        try:
+            orders.append(run_random_monkey_order(monkey.id))
+        except Exception:
+            # One monkey's failure must not abort the whole batch.
+            logger.exception("run_random_monkey_order failed for monkey %s", monkey.id)
     return {
         "enabled": True,
         "orders": len(orders),
@@ -412,9 +491,15 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
     return order
 
 
-@transaction.atomic
 def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=None):
-    monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
+    """Place one order through KIS and keep the local ledger consistent.
+
+    The slow KIS HTTP round-trip happens **outside** any DB transaction/row lock
+    (holding a lock across it was the source of the "database is locked" storms
+    and the "bought but no holding" money-loss bug). Only after KIS confirms the
+    fill do we mutate balance/Holding inside a short, retried atomic block.
+    """
+    monkey = Monkey.objects.get(pk=monkey_id)
     stock = Stock.objects.get(pk=stock_id)
     kis_client = kis_client or KisClient()
 
@@ -425,26 +510,34 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         requested_quantity=quantity,
     )
 
-    try:
-        estimated_price = kis_client.get_stock_price(stock.ticker)
-    except (KisClientError, ValueError) as exc:
-        return _fail_order(order, f"Could not fetch stock price: {exc}")
+    # Prefer the periodically-refreshed cached price (one fewer KIS call per
+    # order); only fetch live when we have nothing cached.
+    estimated_price = stock.current_price
+    if not estimated_price:
+        try:
+            estimated_price = kis_client.get_stock_price(stock.ticker)
+        except (KisClientError, ValueError) as exc:
+            return _fail_order(order, f"Could not fetch stock price: {exc}")
 
     order.estimated_price = estimated_price
     order.save(update_fields=["estimated_price", "updated_at"])
 
     total_price = estimated_price * quantity
+
+    # Pre-trade validation against the current ledger (no lock held).
     if order_type == Order.OrderTypeChoices.BUY and monkey.balance < total_price:
         return _fail_order(order, "Insufficient monkey balance.")
-
-    holding = (
-        Holding.objects.select_for_update().filter(monkey=monkey, stock=stock).first()
-    )
     if order_type == Order.OrderTypeChoices.SELL:
-        held_quantity = holding.quantity if holding else 0
+        held_quantity = (
+            Holding.objects.filter(monkey=monkey, stock=stock)
+            .values_list("quantity", flat=True)
+            .first()
+            or 0
+        )
         if held_quantity < quantity:
             return _fail_order(order, "Insufficient monkey holdings.")
 
+    # Place the order with NO DB transaction/lock held across the HTTP call.
     try:
         request_payload, response_data = kis_client.order_stock(
             order_type=order_type,
@@ -483,37 +576,75 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         )
         return _fail_order(order, response_data.get("msg1") or "KIS rejected order.")
 
-    if order_type == Order.OrderTypeChoices.BUY:
-        monkey.balance -= total_price
-        monkey.save(update_fields=["balance"])
-        holding, _ = Holding.objects.select_for_update().get_or_create(
-            monkey=monkey,
-            stock=stock,
-            defaults={"quantity": 0},
-        )
-        holding.quantity += quantity
-        holding.save(update_fields=["quantity"])
-    else:
-        monkey.balance += total_price
-        monkey.save(update_fields=["balance"])
-        holding.quantity -= quantity
-        _save_holding(holding)
-
-    order.executed_quantity = quantity
-    order.executed_price = estimated_price
-    order.status = Order.StatusChoices.SUCCEEDED
-    order.save(
-        update_fields=[
-            "status",
-            "executed_quantity",
-            "executed_price",
-            "kis_request",
-            "kis_response",
-            "kis_order_status",
-            "kis_order_id",
-            "updated_at",
-        ]
+    # KIS confirmed the fill — now apply the local ledger change atomically.
+    _apply_confirmed_order(
+        order, monkey_id, stock_id, order_type, quantity, estimated_price, total_price
     )
+    return order
+
+
+def _apply_confirmed_order(
+    order, monkey_id, stock_id, order_type, quantity, price, total_price
+):
+    """Mutate balance/Holding for a KIS-confirmed order in a short locked txn.
+
+    Retries on transient DB lock errors. Once KIS has executed the trade we must
+    record it locally, so on the (Postgres-unlikely) exhaustion case we still
+    mark the order SUCCEEDED and leave the holdings reconciliation as backstop.
+    """
+    update_fields = [
+        "status",
+        "executed_quantity",
+        "executed_price",
+        "kis_request",
+        "kis_response",
+        "kis_order_status",
+        "kis_order_id",
+        "updated_at",
+    ]
+    order.executed_quantity = quantity
+    order.executed_price = price
+    order.status = Order.StatusChoices.SUCCEEDED
+
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
+                if order_type == Order.OrderTypeChoices.BUY:
+                    monkey.balance -= total_price
+                    monkey.save(update_fields=["balance"])
+                    holding, _ = Holding.objects.select_for_update().get_or_create(
+                        monkey=monkey,
+                        stock_id=stock_id,
+                        defaults={"quantity": 0},
+                    )
+                    holding.quantity += quantity
+                    holding.save(update_fields=["quantity"])
+                else:
+                    monkey.balance += total_price
+                    monkey.save(update_fields=["balance"])
+                    holding = (
+                        Holding.objects.select_for_update()
+                        .filter(monkey=monkey, stock_id=stock_id)
+                        .first()
+                    )
+                    if holding:
+                        holding.quantity -= quantity
+                        _save_holding(holding)
+                order.save(update_fields=update_fields)
+            return order
+        except OperationalError:
+            logger.warning(
+                "DB lock applying order %s (attempt %d/3)", order.id, attempt + 1
+            )
+            time.sleep(0.2 * (attempt + 1))
+
+    logger.error(
+        "Order %s confirmed by KIS but local ledger update failed after retries; "
+        "holdings reconciliation will reconcile it.",
+        order.id,
+    )
+    order.save(update_fields=update_fields)
     return order
 
 
@@ -551,7 +682,7 @@ def get_or_create_system_monkey():
         is_system=True,
         defaults={
             "name": "(시스템)",
-            "is_active": False,
+            "state": Monkey.State.INACTIVE,
             "balance": 0,
             "initial_balance": 0,
             "order_interval_seconds": 60,
@@ -691,7 +822,7 @@ def liquidate_orphaned_holdings():
     # Sweep killed monkeys that still hold stock (e.g. force-killed while the
     # market was closed, so their sell orders had not gone through yet).
     killed_orders = 0
-    for monkey in Monkey.objects.filter(is_active=False, is_system=False):
+    for monkey in Monkey.objects.filter(state=Monkey.State.DEAD, is_system=False):
         orders = liquidate_holdings_for_monkey(monkey, kis_client=kis_client)
         killed_orders += len(orders)
 

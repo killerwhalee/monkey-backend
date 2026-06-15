@@ -1,3 +1,5 @@
+import logging
+import time
 from datetime import timedelta
 
 import requests
@@ -6,9 +8,64 @@ from django.utils import timezone
 
 from monkey.models import KisAccessToken
 
+logger = logging.getLogger(__name__)
+
 
 class KisClientError(Exception):
     pass
+
+
+# Reserve the next slot and return how long (seconds) the caller must wait. Run
+# as a Lua script so the read-modify-write is atomic across workers/processes.
+_RATE_LIMIT_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local interval = tonumber(ARGV[2])
+local nxt = tonumber(redis.call('get', key) or '0')
+local wait
+if now >= nxt then
+  redis.call('set', key, now + interval, 'PX', 10000)
+  wait = 0
+else
+  redis.call('set', key, nxt + interval, 'PX', 10000)
+  wait = nxt - now
+end
+return tostring(wait)
+"""
+
+_redis_client = None
+
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        import redis
+
+        _redis_client = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+    return _redis_client
+
+
+def kis_throttle(environment):
+    """Block until at least ``KIS_MIN_REQUEST_INTERVAL`` has passed since the last
+    KIS request (shared across all workers/processes via Redis).
+
+    KIS paper trading caps requests at ~1/sec per account, so this is the single
+    chokepoint that keeps the whole fleet within budget. If Redis is unreachable
+    we proceed best-effort rather than block trading.
+    """
+    interval = getattr(settings, "KIS_MIN_REQUEST_INTERVAL", 0)
+    if not interval:
+        return
+    try:
+        client = _get_redis()
+        key = f"kis:ratelimit:{environment}"
+        wait = float(
+            client.eval(_RATE_LIMIT_LUA, 1, key, str(time.time()), str(interval))
+        )
+    except Exception:  # noqa: BLE001 — never let a limiter glitch halt trading
+        return
+    if wait > 0:
+        time.sleep(wait)
 
 
 class KisClient:
@@ -41,7 +98,8 @@ class KisClient:
         return self.refresh_access_token().token
 
     def refresh_access_token(self):
-        response = requests.post(
+        response = self._execute(
+            "POST",
             f"{self.base_url}/oauth2/tokenP",
             headers={"Content-Type": "application/json; charset=UTF-8"},
             json={
@@ -50,7 +108,6 @@ class KisClient:
                 "appsecret": self.app_secret,
             },
         )
-        self._raise_for_response(response)
         data = response.json()
         token = data.get("access_token")
         if not token:
@@ -99,10 +156,11 @@ class KisClient:
                 "CTX_AREA_NK100": "",
             },
         )
+        # An empty paper account ("모의투자 잔고내역이 없습니다") is a normal,
+        # benign response — surface it as zero cash / no holdings, never an error.
+        output2 = data.get("output2") or [{}]
         return {
-            "cash_balance": int(
-                (data.get("output2") or [{}])[0].get("dnca_tot_amt") or 0
-            ),
+            "cash_balance": int((output2[0] or {}).get("dnca_tot_amt") or 0),
             "holdings": {
                 item["pdno"]: int(item.get("hldg_qty") or 0)
                 for item in (data.get("output1") or [])
@@ -151,7 +209,8 @@ class KisClient:
         ctx_nk = ""
         tr_cont = ""
         for _ in range(50):  # hard cap so a malformed continuation can't loop forever
-            response = requests.get(
+            response = self._execute(
+                "GET",
                 f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
                 headers={**self._headers(self.DAILY_CCLD_TR_ID), "tr_cont": tr_cont},
                 params={
@@ -172,7 +231,6 @@ class KisClient:
                     "CTX_AREA_NK100": ctx_nk,
                 },
             )
-            self._raise_for_response(response)
             data = response.json()
             for item in data.get("output1") or []:
                 odno = str(item.get("odno") or "").lstrip("0")
@@ -225,22 +283,81 @@ class KisClient:
         }
 
     def _get(self, path, tr_id, params, base_url=None):
-        response = requests.get(
+        response = self._execute(
+            "GET",
             f"{base_url or self.base_url}{path}",
             headers=self._headers(tr_id),
             params=params,
         )
-        self._raise_for_response(response)
         return response.json()
 
     def _post(self, path, tr_id, payload):
-        response = requests.post(
+        response = self._execute(
+            "POST",
             f"{self.base_url}{path}",
             headers=self._headers(tr_id),
             json=payload,
         )
-        self._raise_for_response(response)
         return response.json()
+
+    def _execute(self, method, url, **kwargs):
+        """Single chokepoint for KIS HTTP: global rate limit + timeout + retry.
+
+        Retries transient failures (network errors, HTTP 5xx, and KIS rate-limit
+        responses) up to ``KIS_MAX_RETRIES`` times — KIS advises an immediate
+        re-call with a short term — then raises ``KisClientError``. Non-transient
+        4xx errors raise immediately.
+        """
+        kwargs.setdefault("timeout", settings.KIS_REQUEST_TIMEOUT)
+        send = requests.post if method == "POST" else requests.get
+        attempts = max(1, getattr(settings, "KIS_MAX_RETRIES", 0) + 1)
+        last_error = None
+        for attempt in range(attempts):
+            kis_throttle(self.environment)
+            try:
+                response = send(url, **kwargs)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_error = KisClientError(f"KIS request network error: {exc}")
+                logger.warning(
+                    "KIS %s %s network error (attempt %d/%d): %s",
+                    method,
+                    url,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+            else:
+                status = getattr(response, "status_code", 200)
+                if status < 500 and not self._is_rate_limited(response):
+                    self._raise_for_response(response)
+                    return response
+                reason = f"HTTP {status}" if status >= 500 else "rate limited"
+                last_error = KisClientError(f"KIS request {reason}: {url}")
+                logger.warning(
+                    "KIS %s %s %s (attempt %d/%d)",
+                    method,
+                    url,
+                    reason,
+                    attempt + 1,
+                    attempts,
+                )
+            if attempt + 1 < attempts:
+                time.sleep(0.15)  # KIS guidance: brief term, then re-call
+        raise last_error or KisClientError(f"KIS request failed: {url}")
+
+    @staticmethod
+    def _is_rate_limited(response):
+        try:
+            data = response.json()
+        except (ValueError, AttributeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        blob = " ".join(
+            str(data.get(key, ""))
+            for key in ("msg1", "msg_cd", "error_code", "error_description")
+        )
+        return "초당" in blob or "EGW00201" in blob or "EGW00133" in blob
 
     def _raise_for_response(self, response):
         try:

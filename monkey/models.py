@@ -91,13 +91,21 @@ class KisAccessToken(models.Model):
 
 
 class Monkey(models.Model):
+    class State(models.TextChoices):
+        ACTIVE = "active", "Active"  # alive and trading
+        INACTIVE = "inactive", "Inactive"  # alive but paused (schedule disabled)
+        DEAD = "dead", "Dead"  # killed permanently; never revives
+
     name = models.CharField(
         "Name",
         max_length=32,
     )
-    is_active = models.BooleanField(
-        "Is active?",
-        default=True,
+    state = models.CharField(
+        "State",
+        max_length=16,
+        choices=State.choices,
+        default=State.ACTIVE,
+        help_text="ACTIVE = trading, INACTIVE = paused, DEAD = killed (never revives).",
     )
     balance = models.IntegerField(
         "Cash balance",
@@ -129,15 +137,39 @@ class Monkey(models.Model):
         auto_now_add=True,
     )
 
+    @property
+    def is_active(self) -> bool:
+        """Convenience read alias kept for API/dashboard compatibility."""
+        return self.state == self.State.ACTIVE
+
     def _periodic_task_name(self):
         return f"monkey.run.{self.pk}"
+
+    @staticmethod
+    def _gate_open() -> bool:
+        """Whether the global trading gate is currently open (time ∧ holiday ∧ manual)."""
+        control = GlobalMonkeyControl.objects.filter(pk=1).first()
+        return bool(control and control.enabled)
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         super().save(*args, **kwargs)
         try:
-            from django_celery_beat.models import IntervalSchedule, PeriodicTask
+            from django_celery_beat.models import (
+                IntervalSchedule,
+                PeriodicTask,
+                PeriodicTasks,
+            )
 
+            # A dead monkey never revives — drop its schedule entirely.
+            if self.state == self.State.DEAD:
+                PeriodicTask.objects.filter(name=self._periodic_task_name()).delete()
+                PeriodicTasks.update_changed()
+                return
+
+            # ACTIVE monkeys run only while the market gate is open; INACTIVE
+            # (paused) monkeys keep their task but disabled, ready to resume.
+            enabled = self.state == self.State.ACTIVE and self._gate_open()
             if is_new:
                 interval, _ = IntervalSchedule.objects.get_or_create(
                     every=self.order_interval_seconds,
@@ -149,13 +181,17 @@ class Monkey(models.Model):
                         "task": "monkey.tasks.run_monkey",
                         "interval": interval,
                         "kwargs": json.dumps({"monkey_id": self.pk}),
-                        "enabled": self.is_active,
+                        "enabled": enabled,
+                        # Skip-the-tick: drop a queued order that waited too long
+                        # rather than execute it stale and back up the queue.
+                        "expire_seconds": min(self.order_interval_seconds, 120),
                     },
                 )
             else:
                 PeriodicTask.objects.filter(name=self._periodic_task_name()).update(
-                    enabled=self.is_active,
+                    enabled=enabled,
                 )
+            PeriodicTasks.update_changed()
         except (OperationalError, ProgrammingError):
             pass  # tables not yet created during initial migrate or test DB setup
 

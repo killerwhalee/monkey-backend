@@ -152,7 +152,7 @@ class FeedbackTaskTests(APITestCase):
         )
 
         with self.settings(FEEDBACK_ADMIN_EMAIL="admin@example.com"):
-            result = tasks.notify_admin_new_feedback(feedback.id)
+            result = tasks.notify_admin_new_feedback(feedback.id)["output"]
 
         self.assertEqual(result["notified"], "admin@example.com")
         self.assertEqual(len(mail.outbox), 1)
@@ -168,7 +168,7 @@ class FeedbackTaskTests(APITestCase):
         )
 
         with self.settings(FEEDBACK_ADMIN_EMAIL=""):
-            result = tasks.notify_admin_new_feedback(feedback.id)
+            result = tasks.notify_admin_new_feedback(feedback.id)["output"]
 
         self.assertIn("skipped", result)
         self.assertEqual(len(mail.outbox), 0)
@@ -182,7 +182,7 @@ class FeedbackTaskTests(APITestCase):
             reply_message="답변 내용입니다.",
         )
 
-        result = tasks.send_feedback_reply_email(feedback.id)
+        result = tasks.send_feedback_reply_email(feedback.id)["output"]
 
         self.assertEqual(result["sent_to"], "visitor@example.com")
         self.assertEqual(len(mail.outbox), 1)

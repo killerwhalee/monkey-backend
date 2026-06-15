@@ -10,12 +10,15 @@ class MonkeySerializer(serializers.ModelSerializer):
     holdings = serializers.SerializerMethodField()
     recent_orders = serializers.SerializerMethodField()
     metrics = serializers.SerializerMethodField()
+    # `is_active` is now a model property (state == ACTIVE); kept for API compatibility.
+    is_active = serializers.ReadOnlyField()
 
     class Meta:
         model = Monkey
         fields = [
             "id",
             "name",
+            "state",
             "is_active",
             "balance",
             "initial_balance",
@@ -60,7 +63,7 @@ class MonkeyBulkCreateSerializer(serializers.Serializer):
     starting_balance = serializers.IntegerField(min_value=0)
 
     def create(self, validated_data):
-        return services.create_monkeys(**validated_data)
+        return services.create_monkeys_checked(**validated_data)
 
 
 class GlobalMonkeyControlSerializer(serializers.ModelSerializer):

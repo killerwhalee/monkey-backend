@@ -143,7 +143,7 @@ class Command(BaseCommand):
                 balance=INITIAL_BALANCE,
                 initial_balance=INITIAL_BALANCE,
                 order_interval_seconds=rng.randint(60, 1800),
-                is_active=active,
+                state=Monkey.State.ACTIVE if active else Monkey.State.DEAD,
             )
             if not active:
                 monkey.killed_at = timezone.now() - timedelta(days=rng.randint(1, 10))
