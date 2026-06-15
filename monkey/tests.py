@@ -344,8 +344,37 @@ class MonkeyServiceTests(TestCase):
 
         self.assertEqual(len(monkeys), 2)
         self.assertEqual(Monkey.objects.filter(is_system=False).count(), 3)
+        starting_balance = services.get_global_control().auto_create_starting_balance
         for monkey in monkeys:
-            self.assertEqual(monkey.balance, services.AUTO_CREATE_STARTING_BALANCE)
+            self.assertEqual(monkey.balance, starting_balance)
+
+    def test_auto_create_uses_configured_starting_balance(self):
+        control = services.get_global_control()
+        control.auto_create_starting_balance = 500_000
+        control.save(update_fields=["auto_create_starting_balance"])
+        fake_client = FakeKisClient(balance=1_500_000)
+
+        monkeys = services.auto_create_monkeys(kis_client=fake_client)
+
+        self.assertEqual(len(monkeys), 3)
+        for monkey in monkeys:
+            self.assertEqual(monkey.balance, 500_000)
+
+    def test_create_monkeys_uses_configured_interval_range(self):
+        control = services.get_global_control()
+        control.auto_create_min_interval_seconds = 300
+        control.auto_create_max_interval_seconds = 300
+        control.save(
+            update_fields=[
+                "auto_create_min_interval_seconds",
+                "auto_create_max_interval_seconds",
+            ]
+        )
+
+        monkeys = services.create_monkeys(count=3, starting_balance=1000)
+
+        for monkey in monkeys:
+            self.assertEqual(monkey.order_interval_seconds, 300)
 
 
 class OrphanedHoldingsTests(TestCase):
@@ -561,6 +590,44 @@ class MonkeyApiTests(APITestCase):
         self.assertEqual(patch_response.status_code, 200)
         self.assertEqual(patch_response.data["manual_enabled"], False)
         self.assertEqual(patch_response.data["enabled"], False)
+
+    def test_admin_can_patch_monkey_config_fields(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        response = self.client.patch(
+            reverse("global-monkey-control-current"),
+            {
+                "auto_create_starting_balance": 250_000,
+                "kill_threshold": -0.8,
+                "auto_create_min_interval_seconds": 120,
+                "auto_create_max_interval_seconds": 600,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        control = services.get_global_control()
+        self.assertEqual(control.auto_create_starting_balance, 250_000)
+        self.assertEqual(control.kill_threshold, -0.8)
+        self.assertEqual(control.auto_create_min_interval_seconds, 120)
+        self.assertEqual(control.auto_create_max_interval_seconds, 600)
+
+    def test_patch_rejects_interval_max_below_min(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        response = self.client.patch(
+            reverse("global-monkey-control-current"),
+            {
+                "auto_create_min_interval_seconds": 600,
+                "auto_create_max_interval_seconds": 300,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("auto_create_max_interval_seconds", response.data)
 
     def test_read_only_gates_cannot_be_patched(self):
         user = get_user_model().objects.create_user(

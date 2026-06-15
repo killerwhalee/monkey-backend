@@ -1,5 +1,6 @@
 import json
 
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import OperationalError, ProgrammingError, models
 
@@ -42,6 +43,24 @@ class GlobalMonkeyControl(models.Model):
         default=-0.5,
         help_text="Monkeys whose earning_ratio drops below this value are automatically deactivated.",
     )
+    auto_create_starting_balance = models.PositiveIntegerField(
+        "Auto-create starting balance",
+        default=1_000_000,
+        validators=[MinValueValidator(1)],
+        help_text="Cash each monkey is created with (auto-create divides unallocated cash by this).",
+    )
+    auto_create_min_interval_seconds = models.PositiveIntegerField(
+        "New monkey min order interval (seconds)",
+        default=60,
+        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        help_text="Lower bound of the random order interval assigned to newly created monkeys.",
+    )
+    auto_create_max_interval_seconds = models.PositiveIntegerField(
+        "New monkey max order interval (seconds)",
+        default=1800,
+        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        help_text="Upper bound of the random order interval assigned to newly created monkeys.",
+    )
     created_at = models.DateTimeField(
         "Created at",
         auto_now_add=True,
@@ -51,10 +70,34 @@ class GlobalMonkeyControl(models.Model):
         auto_now=True,
     )
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(
+                    auto_create_max_interval_seconds__gte=models.F(
+                        "auto_create_min_interval_seconds"
+                    )
+                ),
+                name="globalcontrol_interval_max_gte_min",
+            ),
+        ]
+
     @property
     def enabled(self) -> bool:
         """Effective trading switch: every gate must be open."""
         return self.time_enabled and self.holiday_enabled and self.manual_enabled
+
+    def clean(self):
+        super().clean()
+        if (
+            self.auto_create_max_interval_seconds
+            < self.auto_create_min_interval_seconds
+        ):
+            raise ValidationError(
+                {
+                    "auto_create_max_interval_seconds": "최대 거래 주기는 최소 거래 주기 이상이어야 합니다."
+                }
+            )
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] enabled={self.enabled}"

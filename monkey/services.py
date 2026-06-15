@@ -19,8 +19,6 @@ from monkey.names import generate_monkey_name
 
 logger = logging.getLogger(__name__)
 
-AUTO_CREATE_STARTING_BALANCE = 1_000_000
-
 
 class InsufficientCashError(Exception):
     """Raised when there isn't enough unallocated KIS cash to create monkeys."""
@@ -533,13 +531,17 @@ def unallocated_cash(kis_client=None):
 
 def create_monkeys(count, starting_balance):
     # Individual saves (not bulk_create) so Monkey.save() fires and creates PeriodicTasks.
+    # The random order-interval range is configurable via GlobalMonkeyControl.
+    control = get_global_control()
+    low = control.auto_create_min_interval_seconds
+    high = control.auto_create_max_interval_seconds
     monkeys = []
     for _ in range(count):
         monkey = Monkey(
             name=generate_monkey_name(),
             balance=starting_balance,
             initial_balance=starting_balance,
-            order_interval_seconds=random.randint(60, 1800),
+            order_interval_seconds=random.randint(low, high),
         )
         monkey.save()
         monkeys.append(monkey)
@@ -564,11 +566,14 @@ def create_monkeys_checked(count, starting_balance, kis_client=None):
 def auto_create_monkeys(kis_client=None):
     """Create as many new monkeys as the KIS account's unallocated cash affords."""
     kis_client = kis_client or KisClient()
+    starting_balance = get_global_control().auto_create_starting_balance
+    if starting_balance <= 0:
+        return []
     available = unallocated_cash(kis_client=kis_client)
-    count = available // AUTO_CREATE_STARTING_BALANCE
+    count = available // starting_balance
     if count <= 0:
         return []
-    return create_monkeys(count=count, starting_balance=AUTO_CREATE_STARTING_BALANCE)
+    return create_monkeys(count=count, starting_balance=starting_balance)
 
 
 def run_active_monkeys():
