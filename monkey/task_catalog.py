@@ -27,11 +27,14 @@ RUNNABLE_TASKS = [
         ],
     ),
     (
-        "liquidate_orphaned_holdings",
-        monkey_tasks.liquidate_orphaned_holdings,
-        "미아 보유분 정리",
-        "보유 현황을 점검하여 미아·상장폐지·폐사 보유분을 시스템 원숭이로 이관합니다.",
-        [],
+        "daily_maintenance",
+        monkey_tasks.daily_maintenance,
+        "일일 정리 작업",
+        "장 마감 중에 부진한 원숭이를 도태시키고, 미아·상장폐지·폐사 보유분을 시스템 원숭이로 이관합니다. (장중에는 건너뜁니다)",
+        [
+            "수익률이 도태 기준 미만인 원숭이가 폐사 처리됩니다.",
+            "장이 열려 있는 동안에는 실행되지 않고 건너뜁니다.",
+        ],
     ),
     (
         "run_system_monkey",
@@ -95,10 +98,10 @@ RUNNABLE_TASKS = [
         [],
     ),
     (
-        "record_earning_ratio_tick",
-        monkey_tasks.record_earning_ratio_tick,
-        "수익률 틱 기록",
-        "전체 평균 수익률을 시계열 틱으로 기록합니다.",
+        "record_index_tick",
+        monkey_tasks.record_index_tick,
+        "원숭이 지수 틱 기록",
+        "현재 원숭이 지수 값을 시계열 틱으로 기록합니다.",
         [],
     ),
     (

@@ -158,9 +158,22 @@ class KisClient:
         )
         # An empty paper account ("모의투자 잔고내역이 없습니다") is a normal,
         # benign response — surface it as zero cash / no holdings, never an error.
-        output2 = data.get("output2") or [{}]
+        summary = (data.get("output2") or [{}])[0] or {}
+
+        def _to_float(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
         return {
-            "cash_balance": int((output2[0] or {}).get("dnca_tot_amt") or 0),
+            "cash_balance": int(summary.get("dnca_tot_amt") or 0),
+            "securities_value": int(summary.get("scts_evlu_amt") or 0),
+            "total_assets": int(summary.get("tot_evlu_amt") or 0),
+            "total_pl": int(summary.get("evlu_pfls_smtl_amt") or 0),
+            # asst_icdc_erng_rt is a percentage figure (e.g. "1.23"); expose it as
+            # a fraction so the frontend can format it like the monkey ratios.
+            "earning_rate": _to_float(summary.get("asst_icdc_erng_rt")) / 100.0,
             "holdings": {
                 item["pdno"]: int(item.get("hldg_qty") or 0)
                 for item in (data.get("output1") or [])

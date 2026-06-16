@@ -238,5 +238,5 @@ class CandlestickView(views.APIView):
             limit = min(int(request.query_params.get("limit", 120)), 1000)
         except (TypeError, ValueError):
             limit = 120
-        data = services.build_earning_ratio_candlesticks(unit=unit, limit=limit)
+        data = services.build_index_candlesticks(unit=unit, limit=limit)
         return Response(serializers.CandlestickSerializer(data, many=True).data)

@@ -54,6 +54,7 @@ def check_holiday():
 def market_open():
     services.set_trading_enabled(True, note="장 시작 (자동)")
     services.sync_monkey_periodic_tasks()
+    services.capture_index_baseline()
     return {"enabled": True}
 
 
@@ -70,8 +71,8 @@ def snapshot_monkeys():
 
 
 @shared_task
-def liquidate_orphaned_holdings():
-    return services.liquidate_orphaned_holdings()
+def daily_maintenance():
+    return services.run_daily_maintenance()
 
 
 @shared_task
@@ -81,8 +82,8 @@ def auto_create_monkeys():
 
 
 @shared_task
-def record_earning_ratio_tick():
-    return services.record_earning_ratio_tick()
+def record_index_tick():
+    return services.record_index_tick()
 
 
 @shared_task

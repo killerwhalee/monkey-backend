@@ -4,7 +4,7 @@ import time
 from datetime import timedelta
 
 from django.db import OperationalError, transaction
-from django.db.models import Avg, Max, Sum
+from django.db.models import Sum
 from django.utils import timezone
 
 from market.models import Holding, Order, Stock
@@ -13,11 +13,16 @@ from monkey.models import (
     GlobalMonkeyControl,
     Monkey,
     MonkeyDailySnapshot,
-    MonkeyEarningRatioTick,
+    MonkeyIndexBaseline,
+    MonkeyIndexTick,
 )
 from monkey.names import generate_monkey_name
 
 logger = logging.getLogger(__name__)
+
+# Cold-start value for the Monkey Index, used only when no index has ever been
+# recorded; afterwards each day chains off the previous day's closing value.
+MONKEY_INDEX_BASE = 10000.0
 
 
 class InsufficientCashError(Exception):
@@ -256,16 +261,23 @@ def kill_monkey(monkey: Monkey) -> Monkey:
     return monkey
 
 
-def maybe_kill_monkey(monkey: Monkey) -> bool:
-    """Kill monkey if earning_ratio < kill_threshold. Returns True if killed."""
+def kill_underperforming_monkeys() -> int:
+    """Kill every alive monkey whose earning_ratio is below the kill threshold.
+
+    Run as a daily off-market task (see run_daily_maintenance) rather than per
+    trade, so the alive set stays fixed during a trading session and the Monkey
+    Index baseline/live equity remain comparable. Returns the number killed.
+    """
     # Deferred import: serializers.py does `from monkey import services`.
     from monkey.serializers import build_monkey_metrics
 
-    control = get_global_control()
-    if build_monkey_metrics(monkey)["earning_ratio"] < control.kill_threshold:
-        kill_monkey(monkey)
-        return True
-    return False
+    threshold = get_global_control().kill_threshold
+    killed = 0
+    for monkey in _alive_monkeys():
+        if build_monkey_metrics(monkey)["earning_ratio"] < threshold:
+            kill_monkey(monkey)
+            killed += 1
+    return killed
 
 
 def snapshot_all_monkeys(target_date=None):
@@ -287,18 +299,8 @@ def snapshot_all_monkeys(target_date=None):
 
 
 def build_dashboard_summary():
-    from monkey.serializers import build_monkey_metrics
-
     monkeys = list(Monkey.objects.filter(is_system=False))
-    metrics = [build_monkey_metrics(monkey) for monkey in monkeys]
-    ratios = [item["earning_ratio"] for item in metrics]
-
     active_monkeys = [monkey for monkey in monkeys if monkey.is_active]
-    total_initial = sum(monkey.initial_balance for monkey in monkeys)
-    total_cash = sum(item["cash_balance"] for item in metrics)
-    total_holdings = sum(item["holdings_value"] for item in metrics)
-    total_equity = total_cash + total_holdings
-    total_pl = total_equity - total_initial
     average_interval = (
         round(
             sum(monkey.order_interval_seconds for monkey in active_monkeys)
@@ -308,25 +310,16 @@ def build_dashboard_summary():
         else 0
     )
 
-    daily_series = list(
-        MonkeyDailySnapshot.objects.values("date")
-        .annotate(
-            average_earning_ratio=Avg("earning_ratio"),
-            best_earning_ratio=Max("earning_ratio"),
-        )
-        .order_by("date")
-    )
+    monkey_index = current_index_value()
+    baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
+    base_index = baseline.base_index if baseline else monkey_index
+    monkey_index_change = (monkey_index / base_index - 1) if base_index else 0.0
 
     return {
         "active_monkey_count": len(active_monkeys),
-        "average_earning_ratio": (sum(ratios) / len(ratios)) if ratios else 0.0,
-        "best_earning_ratio": max(ratios) if ratios else 0.0,
-        "total_initial_balance": total_initial,
-        "total_cash_balance": total_cash,
-        "total_holdings_value": total_holdings,
-        "total_equity": total_equity,
-        "total_pl": total_pl,
-        "earning_ratio": (total_pl / total_initial) if total_initial else 0.0,
+        "monkey_index": monkey_index,
+        "monkey_index_open": base_index,
+        "monkey_index_change": monkey_index_change,
         "average_order_interval_seconds": average_interval,
         "latest_orders": (
             Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
@@ -334,30 +327,88 @@ def build_dashboard_summary():
             .exclude(monkey__is_system=True)
             .order_by("-created_at")[:10]
         ),
-        "daily_earning_ratio_series": daily_series,
     }
 
 
-def _earning_ratios():
+def _alive_monkeys():
+    """Monkeys whose equity counts toward the index: alive (ACTIVE or INACTIVE),
+    non-system. DEAD monkeys are excluded so the alive set stays fixed during a
+    session (killing only happens off-market)."""
+    return Monkey.objects.filter(is_system=False).exclude(state=Monkey.State.DEAD)
+
+
+def _alive_equity():
+    """Summed total equity of alive monkeys (``a`` at open / ``b`` while open)."""
     from monkey.serializers import build_monkey_metrics
 
-    return [
-        build_monkey_metrics(monkey)["earning_ratio"]
-        for monkey in Monkey.objects.filter(is_system=False)
-    ]
+    return sum(
+        build_monkey_metrics(monkey)["total_equity"] for monkey in _alive_monkeys()
+    )
 
 
-def record_earning_ratio_tick():
-    """Sample the current average earning ratio. Gated on the global kill
-    switch (mirrors run_monkey) so each day's ticks form a clean trading-
-    session candle."""
+def capture_index_baseline(target_date=None):
+    """Record today's index baseline: ``base_equity`` (alive equity now) and
+    ``base_index`` (yesterday's closing index, carried forward). Called at market
+    open before any ticks are sampled."""
+    target_date = target_date or timezone.localdate()
+
+    last_tick = (
+        MonkeyIndexTick.objects.filter(recorded_at__date__lt=target_date)
+        .order_by("recorded_at")
+        .last()
+    )
+    if last_tick is not None:
+        base_index = last_tick.value
+    else:
+        prior_baseline = (
+            MonkeyIndexBaseline.objects.filter(date__lt=target_date)
+            .order_by("date")
+            .last()
+        )
+        base_index = prior_baseline.base_index if prior_baseline else MONKEY_INDEX_BASE
+
+    baseline, _ = MonkeyIndexBaseline.objects.update_or_create(
+        date=target_date,
+        defaults={"base_index": base_index, "base_equity": _alive_equity()},
+    )
+    return baseline
+
+
+def record_index_tick():
+    """Sample the current Monkey Index value: ``base_index * (b / a)``. Gated on
+    the global kill switch (mirrors run_monkey) so each day's ticks form a clean
+    trading-session candle. Skips if today's baseline hasn't been captured yet."""
     if not get_global_control().enabled:
         return {"enabled": False}
 
-    ratios = _earning_ratios()
-    average = (sum(ratios) / len(ratios)) if ratios else 0.0
-    tick = MonkeyEarningRatioTick.objects.create(average_earning_ratio=average)
-    return {"enabled": True, "tick_id": tick.id, "average_earning_ratio": average}
+    baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
+    if baseline is None:
+        return {"enabled": True, "baseline": False}
+
+    if baseline.base_equity:
+        value = baseline.base_index * (_alive_equity() / baseline.base_equity)
+    else:
+        value = baseline.base_index
+    tick = MonkeyIndexTick.objects.create(value=value)
+    return {"enabled": True, "tick_id": tick.id, "value": value}
+
+
+def current_index_value():
+    """Latest recorded index value: today's last tick, else today's base_index,
+    else the cold-start base."""
+    today = timezone.localdate()
+    last_tick = (
+        MonkeyIndexTick.objects.filter(recorded_at__date=today)
+        .order_by("recorded_at")
+        .last()
+    )
+    if last_tick is not None:
+        return last_tick.value
+    baseline = MonkeyIndexBaseline.objects.filter(date=today).first()
+    if baseline is not None:
+        return baseline.base_index
+    last_baseline = MonkeyIndexBaseline.objects.order_by("date").last()
+    return last_baseline.base_index if last_baseline else MONKEY_INDEX_BASE
 
 
 CANDLE_UNIT_SECONDS = {
@@ -374,8 +425,8 @@ CANDLE_UNIT_SECONDS = {
 KST_OFFSET_SECONDS = 9 * 3600
 
 
-def build_earning_ratio_candlesticks(unit="1d", limit=120):
-    """Bucket per-minute earning-ratio ticks into OHLC candlesticks.
+def build_index_candlesticks(unit="1d", limit=120):
+    """Bucket per-minute Monkey Index ticks into OHLC candlesticks.
 
     ``unit`` is one of ``CANDLE_UNIT_SECONDS``. Each candle's ``time`` is the
     bucket-start as epoch seconds (what lightweight-charts expects). ``1d``
@@ -384,9 +435,9 @@ def build_earning_ratio_candlesticks(unit="1d", limit=120):
     """
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
     buckets = {}
-    for recorded_at, ratio in MonkeyEarningRatioTick.objects.order_by(
+    for recorded_at, value in MonkeyIndexTick.objects.order_by(
         "recorded_at"
-    ).values_list("recorded_at", "average_earning_ratio"):
+    ).values_list("recorded_at", "value"):
         if unit == "1d":
             local = timezone.localtime(recorded_at)
             midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -394,7 +445,7 @@ def build_earning_ratio_candlesticks(unit="1d", limit=120):
         else:
             ts = int(recorded_at.timestamp()) + KST_OFFSET_SECONDS
             bucket = ts - (ts % seconds)
-        buckets.setdefault(bucket, []).append(ratio)
+        buckets.setdefault(bucket, []).append(value)
 
     candlesticks = [
         {
@@ -483,33 +534,28 @@ def reconcile_order_executions(kis_client=None, lookback_days=1):
 
 
 def build_account_summary(kis_client=None):
-    from monkey.serializers import build_monkey_metrics
+    """Live KIS-account asset snapshot for the manage page.
 
+    Asset figures (cash/holdings/total/P&L/earning rate) come straight from the
+    KIS account inquiry — not the local DB — so they reflect the real paper
+    account regardless of monkey bookkeeping. Monkey counts and unallocated cash
+    are still derived locally since they have no KIS equivalent.
+    """
     kis_client = kis_client or KisClient()
-    cash_balance = kis_client.get_account_balance()["cash_balance"]
+    balance = kis_client.get_account_balance()
 
     monkeys = list(Monkey.objects.filter(is_system=False))
-    metrics = [build_monkey_metrics(monkey) for monkey in monkeys]
     total_monkey_balance = sum(monkey.balance for monkey in monkeys)
-    ratios = [item["earning_ratio"] for item in metrics]
-
-    system_monkey = Monkey.objects.filter(is_system=True).first()
-    system_metrics = build_monkey_metrics(system_monkey) if system_monkey else None
 
     return {
-        "kis_cash_balance": cash_balance,
-        "unallocated_cash": cash_balance - total_monkey_balance,
+        "kis_cash_balance": balance["cash_balance"],
+        "kis_holdings_value": balance["securities_value"],
+        "kis_total_assets": balance["total_assets"],
+        "kis_total_pl": balance["total_pl"],
+        "kis_earning_rate": balance["earning_rate"],
+        "unallocated_cash": balance["cash_balance"] - total_monkey_balance,
         "monkey_count": len(monkeys),
         "active_monkey_count": sum(monkey.is_active for monkey in monkeys),
-        "total_monkey_balance": total_monkey_balance,
-        "total_holdings_value": sum(item["holdings_value"] for item in metrics),
-        "total_equity": sum(item["total_equity"] for item in metrics),
-        "average_earning_ratio": (sum(ratios) / len(ratios)) if ratios else 0.0,
-        "best_earning_ratio": max(ratios) if ratios else 0.0,
-        "system_balance": system_monkey.balance if system_monkey else 0,
-        "system_holdings_value": (
-            system_metrics["holdings_value"] if system_metrics else 0
-        ),
     }
 
 
@@ -640,10 +686,8 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
         quantity=quantity,
         kis_client=kis_client,
     )
-    # Kill check outside the atomic block: refresh balance first since submit_monkey_order
-    # updated it in its own transaction.
-    monkey.refresh_from_db()
-    maybe_kill_monkey(monkey)
+    # Underperformers are no longer culled here — killing is a daily off-market
+    # task (run_daily_maintenance) so the alive set stays fixed during a session.
     return order
 
 
@@ -994,14 +1038,22 @@ def reconcile_holdings(kis_client=None):
     return {"absorbed": absorbed, "clamped": clamped}
 
 
-def liquidate_orphaned_holdings():
-    """Reconcile real-vs-local holdings and hand off orphaned/delisted/dead-monkey
-    holdings to the system monkey for gradual liquidation.
+def run_daily_maintenance():
+    """Daily off-market upkeep: cull underperforming monkeys, then reconcile
+    real-vs-local holdings and hand off orphaned/delisted/dead-monkey holdings to
+    the system monkey for gradual liquidation.
 
-    DB-only moves plus a single KIS *read* (account balance) — no sell orders are
-    placed here, so this can run anytime, market open or closed. The system
-    monkey's own periodic task does the actual selling during market hours.
+    Skips entirely while the market is open so killing never happens during a
+    trading session (which would break the Monkey Index baseline/live-equity
+    comparison). DB-only moves plus a single KIS *read* (account balance) — no
+    sell orders are placed here. The system monkey's own periodic task does the
+    actual selling during market hours.
     """
+    if get_global_control().enabled:
+        return {"skipped": "market_open"}
+
+    killed = kill_underperforming_monkeys()
+
     kis_client = KisClient()
     reconciliation = reconcile_holdings(kis_client=kis_client)
 
@@ -1026,6 +1078,7 @@ def liquidate_orphaned_holdings():
         killed_transfers += len(transferred)
 
     return {
+        "killed": killed,
         "reconciliation": reconciliation,
         "delisted_transfers": delisted_transfers,
         "killed_transfers": killed_transfers,
