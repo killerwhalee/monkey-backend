@@ -9,6 +9,7 @@ cash, or flips the trading gate); each item describes one consequence of running
 it, shown as a bullet list in the confirmation dialog.
 """
 
+from core.celery import app as celery_app
 from market import tasks as market_tasks
 from monkey import tasks as monkey_tasks
 
@@ -119,6 +120,13 @@ RUNNABLE_TASKS = [
         monkey_tasks.check_holiday,
         "휴장일 확인",
         "오늘이 개장일인지 KIS 휴장일 API로 확인하고 게이트를 갱신합니다.",
+        [],
+    ),
+    (
+        "backend_cleanup",
+        celery_app.tasks["celery.backend_cleanup"],
+        "만료 작업 결과 정리",
+        "기간이 지난 Celery 작업 결과 기록을 삭제합니다.",
         [],
     ),
 ]
