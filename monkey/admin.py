@@ -51,8 +51,15 @@ class MonkeyDailySnapshotAdmin(admin.ModelAdmin):
     readonly_fields = ["created_at"]
 
 
-@admin.register(models.MonkeyEarningRatioTick)
-class MonkeyEarningRatioTickAdmin(admin.ModelAdmin):
-    list_display = ["id", "recorded_at", "average_earning_ratio"]
+@admin.register(models.MonkeyIndexTick)
+class MonkeyIndexTickAdmin(admin.ModelAdmin):
+    list_display = ["id", "recorded_at", "value"]
     readonly_fields = ["recorded_at"]
     date_hierarchy = "recorded_at"
+
+
+@admin.register(models.MonkeyIndexBaseline)
+class MonkeyIndexBaselineAdmin(admin.ModelAdmin):
+    list_display = ["id", "date", "base_index", "base_equity"]
+    readonly_fields = ["created_at"]
+    date_hierarchy = "date"

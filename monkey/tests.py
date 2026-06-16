@@ -416,7 +416,7 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(holding.quantity, 2)
         self.assertEqual(Order.objects.count(), 0)
 
-    def test_liquidate_orphaned_holdings_transfers_delisted_to_system_monkey(self):
+    def test_daily_maintenance_transfers_delisted_to_system_monkey(self):
         delisted_stock = Stock.objects.create(
             market="KOSPI", ticker="999999", name="Delisted Co", is_active=False
         )
@@ -427,7 +427,7 @@ class OrphanedHoldingsTests(TestCase):
         fake_client = FakeKisClient(price=100, holdings={"005930": 2, "999999": 1})
 
         with mock.patch("monkey.services.KisClient", return_value=fake_client):
-            result = services.liquidate_orphaned_holdings()
+            result = services.run_daily_maintenance()
 
         self.assertEqual(result["delisted_transfers"], 1)
         # Active-stock holding is untouched; delisted one moves to the system monkey.
@@ -444,7 +444,7 @@ class OrphanedHoldingsTests(TestCase):
         )
         self.assertFalse(Order.objects.exists())
 
-    def test_liquidate_orphaned_holdings_runs_with_gate_closed(self):
+    def test_daily_maintenance_runs_with_gate_closed(self):
         # No selling happens here, so it must work even when trading is disabled.
         services.set_trading_enabled(False)
 
@@ -456,7 +456,7 @@ class OrphanedHoldingsTests(TestCase):
         fake_client = FakeKisClient(price=100, holdings={"005930": 3})
 
         with mock.patch("monkey.services.KisClient", return_value=fake_client):
-            result = services.liquidate_orphaned_holdings()
+            result = services.run_daily_maintenance()
 
         self.assertEqual(result["killed_transfers"], 1)
         self.assertFalse(
@@ -466,6 +466,34 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(
             Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 3
         )
+
+    def test_daily_maintenance_skips_while_market_open(self):
+        # Killing during a session would break the index baseline, so the task
+        # no-ops whenever the trading gate is open.
+        services.set_trading_enabled(True)
+        loser = Monkey.objects.create(name="L", balance=0, initial_balance=1000)
+
+        with mock.patch("monkey.services.KisClient", return_value=FakeKisClient()):
+            result = services.run_daily_maintenance()
+
+        self.assertEqual(result, {"skipped": "market_open"})
+        loser.refresh_from_db()
+        self.assertEqual(loser.state, Monkey.State.ACTIVE)
+
+    def test_daily_maintenance_culls_underperforming_monkeys(self):
+        # earning_ratio = (balance - initial) / initial = (100 - 1000)/1000 = -0.9,
+        # below the default kill threshold (-0.5), so the monkey is culled.
+        loser = Monkey.objects.create(name="L", balance=100, initial_balance=1000)
+        winner = Monkey.objects.create(name="W", balance=1000, initial_balance=1000)
+
+        with mock.patch("monkey.services.KisClient", return_value=FakeKisClient()):
+            result = services.run_daily_maintenance()
+
+        self.assertEqual(result["killed"], 1)
+        loser.refresh_from_db()
+        winner.refresh_from_db()
+        self.assertEqual(loser.state, Monkey.State.DEAD)
+        self.assertEqual(winner.state, Monkey.State.ACTIVE)
 
     def test_run_system_monkey_order_sells_full_quantity_and_keeps_zero_balance(self):
         system_monkey = services.get_or_create_system_monkey()
@@ -599,7 +627,7 @@ class MonkeyApiTests(APITestCase):
         list_response = self.client.get(reverse("monkey-list"))
         self.assertNotIn(system_monkey.id, [item["id"] for item in list_response.data])
 
-        self.assertEqual(len(services._earning_ratios()), 1)
+        self.assertEqual(len(services._alive_monkeys()), 1)
 
         snapshot_result = services.snapshot_all_monkeys()
         self.assertEqual(snapshot_result["snapshots"], 1)
@@ -846,7 +874,7 @@ class TaskScheduleApiTests(APITestCase):
         names = [row["name"] for row in response.data]
         self.assertNotIn("monkey.run.999", names)
         self.assertIn("monkey.update_held_stock_prices", names)
-        self.assertIn("monkey.earning_ratio_tick", names)
+        self.assertIn("monkey.index_tick", names)
         # Ascending by cadence.
         everys = [row["every"] for row in response.data]
         self.assertEqual(everys, sorted(everys))
@@ -980,16 +1008,17 @@ class DashboardSummaryApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["active_monkey_count"], 0)
-        self.assertEqual(response.data["average_earning_ratio"], 0.0)
-        self.assertEqual(response.data["best_earning_ratio"], 0.0)
+        # No baseline/ticks yet: index sits at the cold-start base, flat vs "open".
+        self.assertEqual(response.data["monkey_index"], services.MONKEY_INDEX_BASE)
+        self.assertEqual(response.data["monkey_index_change"], 0.0)
         self.assertEqual(response.data["latest_orders"], [])
-        self.assertEqual(response.data["daily_earning_ratio_series"], [])
 
     def test_dashboard_summary_shape_and_values(self):
         active_monkey = Monkey.objects.create(
             name="A", balance=6000, initial_balance=5000, state=Monkey.State.ACTIVE
         )
-        paused_monkey = Monkey.objects.create(
+        # An INACTIVE monkey still exists but must not count toward active_monkey_count.
+        Monkey.objects.create(
             name="B", balance=4000, initial_balance=5000, state=Monkey.State.INACTIVE
         )
 
@@ -1022,53 +1051,22 @@ class DashboardSummaryApiTests(APITestCase):
                 created_at=base_time - timedelta(minutes=offset)
             )
 
-        MonkeyDailySnapshot.objects.create(
-            monkey=active_monkey,
-            date=date(2026, 6, 8),
-            cash_balance=6000,
-            holdings_value=0,
-            total_equity=6000,
-            total_pl=1000,
-            realized_pl=0,
-            unrealized_pl=0,
-            earning_ratio=0.2,
+        # Today's baseline (i=10,000, a=10,000) plus a tick at 10,500 → the index
+        # reads 10,500, up 5% vs the day's open.
+        from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
+
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=10000
         )
-        MonkeyDailySnapshot.objects.create(
-            monkey=paused_monkey,
-            date=date(2026, 6, 8),
-            cash_balance=4000,
-            holdings_value=0,
-            total_equity=4000,
-            total_pl=-1000,
-            realized_pl=0,
-            unrealized_pl=0,
-            earning_ratio=-0.2,
-        )
-        MonkeyDailySnapshot.objects.create(
-            monkey=active_monkey,
-            date=date(2026, 6, 9),
-            cash_balance=6500,
-            holdings_value=0,
-            total_equity=6500,
-            total_pl=1500,
-            realized_pl=0,
-            unrealized_pl=0,
-            earning_ratio=0.3,
-        )
+        MonkeyIndexTick.objects.create(value=10500.0)
 
         response = self.client.get(reverse("dashboard-summary"))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["active_monkey_count"], 1)
-
-        ratios = [
-            build_monkey_metrics(m)["earning_ratio"]
-            for m in (active_monkey, paused_monkey)
-        ]
-        self.assertAlmostEqual(
-            response.data["average_earning_ratio"], sum(ratios) / len(ratios)
-        )
-        self.assertAlmostEqual(response.data["best_earning_ratio"], max(ratios))
+        self.assertAlmostEqual(response.data["monkey_index"], 10500.0)
+        self.assertAlmostEqual(response.data["monkey_index_open"], 10000.0)
+        self.assertAlmostEqual(response.data["monkey_index_change"], 0.05)
 
         latest_orders = response.data["latest_orders"]
         # Up to 10 succeeded orders, newest first; the failed order is excluded.
@@ -1082,15 +1080,6 @@ class DashboardSummaryApiTests(APITestCase):
                 .values_list("id", flat=True)[:10]
             ),
         )
-
-        series = response.data["daily_earning_ratio_series"]
-        self.assertEqual(
-            [point["date"] for point in series], ["2026-06-08", "2026-06-09"]
-        )
-        self.assertAlmostEqual(series[0]["average_earning_ratio"], 0.0)
-        self.assertAlmostEqual(series[0]["best_earning_ratio"], 0.2)
-        self.assertAlmostEqual(series[1]["average_earning_ratio"], 0.3)
-        self.assertAlmostEqual(series[1]["best_earning_ratio"], 0.3)
 
 
 class JWTAuthTests(APITestCase):
@@ -1322,15 +1311,15 @@ class ExecutionReconciliationTests(TestCase):
 
 class CandlestickApiTests(APITestCase):
     def test_candlesticks_endpoint_is_public_and_buckets_by_unit(self):
-        from monkey.models import MonkeyEarningRatioTick
+        from monkey.models import MonkeyIndexTick
 
         ticks = [
-            MonkeyEarningRatioTick.objects.create(average_earning_ratio=ratio)
-            for ratio in (0.1, 0.3, 0.2)
+            MonkeyIndexTick.objects.create(value=value)
+            for value in (10100.0, 10300.0, 10200.0)
         ]
         base = timezone.now()
         for offset, tick in enumerate(ticks):
-            MonkeyEarningRatioTick.objects.filter(pk=tick.pk).update(
+            MonkeyIndexTick.objects.filter(pk=tick.pk).update(
                 recorded_at=base - timedelta(minutes=2 - offset)
             )
 
@@ -1338,24 +1327,85 @@ class CandlestickApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
         candle = response.data[0]
-        self.assertEqual(candle["open"], 0.1)
-        self.assertEqual(candle["high"], 0.3)
-        self.assertEqual(candle["low"], 0.1)
-        self.assertEqual(candle["close"], 0.2)
+        self.assertEqual(candle["open"], 10100.0)
+        self.assertEqual(candle["high"], 10300.0)
+        self.assertEqual(candle["low"], 10100.0)
+        self.assertEqual(candle["close"], 10200.0)
         self.assertIn("time", candle)
 
     def test_intraday_buckets_are_shifted_to_kst(self):
-        from monkey.models import MonkeyEarningRatioTick
+        from monkey.models import MonkeyIndexTick
 
-        tick = MonkeyEarningRatioTick.objects.create(average_earning_ratio=0.1)
+        tick = MonkeyIndexTick.objects.create(value=10100.0)
         known = timezone.now().replace(microsecond=0)
-        MonkeyEarningRatioTick.objects.filter(pk=tick.pk).update(recorded_at=known)
+        MonkeyIndexTick.objects.filter(pk=tick.pk).update(recorded_at=known)
 
-        candles = services.build_earning_ratio_candlesticks(unit="1m")
+        candles = services.build_index_candlesticks(unit="1m")
 
         shifted = int(known.timestamp()) + services.KST_OFFSET_SECONDS
         expected = shifted - (shifted % 60)
         self.assertEqual(candles[-1]["time"], expected)
+
+
+class MonkeyIndexTests(TestCase):
+    def test_baseline_cold_starts_at_base_value(self):
+        Monkey.objects.create(name="A", balance=10000, initial_balance=10000)
+
+        baseline = services.capture_index_baseline()
+
+        self.assertEqual(baseline.base_index, services.MONKEY_INDEX_BASE)
+        self.assertEqual(baseline.base_equity, 10000)
+
+    def test_baseline_carries_forward_yesterday_close(self):
+        from monkey.models import MonkeyIndexTick
+
+        Monkey.objects.create(name="A", balance=10000, initial_balance=10000)
+        tick = MonkeyIndexTick.objects.create(value=10500.0)
+        yesterday = timezone.now() - timedelta(days=1)
+        MonkeyIndexTick.objects.filter(pk=tick.pk).update(recorded_at=yesterday)
+
+        baseline = services.capture_index_baseline()
+
+        self.assertEqual(baseline.base_index, 10500.0)
+
+    def test_record_tick_is_gated(self):
+        services.set_trading_enabled(False)
+        self.assertEqual(services.record_index_tick(), {"enabled": False})
+
+    def test_record_tick_skips_without_baseline(self):
+        services.set_trading_enabled(True)
+        self.assertEqual(
+            services.record_index_tick(), {"enabled": True, "baseline": False}
+        )
+
+    def test_record_tick_scales_index_by_equity_ratio(self):
+        from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
+
+        services.set_trading_enabled(True)
+        # Alive equity now is 12,000; baseline a=10,000, i=10,000 → 10,000 * 1.2.
+        Monkey.objects.create(name="A", balance=12000, initial_balance=10000)
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=10000
+        )
+
+        result = services.record_index_tick()
+
+        self.assertAlmostEqual(result["value"], 12000.0)
+        self.assertAlmostEqual(
+            MonkeyIndexTick.objects.latest("recorded_at").value, 12000.0
+        )
+
+    def test_record_tick_flat_when_base_equity_zero(self):
+        from monkey.models import MonkeyIndexBaseline
+
+        services.set_trading_enabled(True)
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=0
+        )
+
+        result = services.record_index_tick()
+
+        self.assertAlmostEqual(result["value"], 10000.0)
 
 
 class MonkeyStateLifecycleTests(TestCase):

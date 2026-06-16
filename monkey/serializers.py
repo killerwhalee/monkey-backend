@@ -131,24 +131,15 @@ class KisAccessTokenSerializer(serializers.ModelSerializer):
         ]
 
 
-class DailyEarningRatioPointSerializer(serializers.Serializer):
-    date = serializers.DateField()
-    average_earning_ratio = serializers.FloatField()
-    best_earning_ratio = serializers.FloatField()
-
-
 class AccountSummarySerializer(serializers.Serializer):
     kis_cash_balance = serializers.IntegerField()
+    kis_holdings_value = serializers.IntegerField()
+    kis_total_assets = serializers.IntegerField()
+    kis_total_pl = serializers.IntegerField()
+    kis_earning_rate = serializers.FloatField()
     unallocated_cash = serializers.IntegerField()
     monkey_count = serializers.IntegerField()
     active_monkey_count = serializers.IntegerField()
-    total_monkey_balance = serializers.IntegerField()
-    total_holdings_value = serializers.IntegerField()
-    total_equity = serializers.IntegerField()
-    average_earning_ratio = serializers.FloatField()
-    best_earning_ratio = serializers.FloatField()
-    system_balance = serializers.IntegerField()
-    system_holdings_value = serializers.IntegerField()
 
 
 class CandlestickSerializer(serializers.Serializer):
@@ -161,17 +152,11 @@ class CandlestickSerializer(serializers.Serializer):
 
 class DashboardSummarySerializer(serializers.Serializer):
     active_monkey_count = serializers.IntegerField()
-    average_earning_ratio = serializers.FloatField()
-    best_earning_ratio = serializers.FloatField()
-    total_initial_balance = serializers.IntegerField()
-    total_cash_balance = serializers.IntegerField()
-    total_holdings_value = serializers.IntegerField()
-    total_equity = serializers.IntegerField()
-    total_pl = serializers.IntegerField()
-    earning_ratio = serializers.FloatField()
+    monkey_index = serializers.FloatField()
+    monkey_index_open = serializers.FloatField()
+    monkey_index_change = serializers.FloatField()
     average_order_interval_seconds = serializers.IntegerField()
     latest_orders = OrderSerializer(many=True)
-    daily_earning_ratio_series = DailyEarningRatioPointSerializer(many=True)
 
 
 def build_monkey_metrics(monkey):

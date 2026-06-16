@@ -6,9 +6,10 @@ produce, so the frontend has data to fetch while Celery is **not** running:
 - a "trading" GlobalMonkeyControl (all three gates open),
 - stocks with live ``current_price`` (normally set by ``update_held_stock_prices``),
 - monkeys with holdings and a succeeded order history (normally produced by trading),
-- daily snapshots (normally ``snapshot_monkeys``) for the line chart,
-- per-minute earning-ratio ticks (normally ``record_earning_ratio_tick``) spanning
-  several trading days so the candle chart renders at every unit.
+- daily snapshots (normally ``snapshot_monkeys``) for per-monkey history,
+- per-minute Monkey Index ticks + daily baselines (normally ``record_index_tick`` /
+  ``capture_index_baseline``) spanning several trading days so the candle chart
+  renders at every unit.
 
 Usage::
 
@@ -26,7 +27,12 @@ from django.utils import timezone
 
 from market.models import Holding, Order, Stock
 from monkey import services
-from monkey.models import Monkey, MonkeyDailySnapshot, MonkeyEarningRatioTick
+from monkey.models import (
+    Monkey,
+    MonkeyDailySnapshot,
+    MonkeyIndexBaseline,
+    MonkeyIndexTick,
+)
 from monkey.names import generate_monkey_name
 
 INITIAL_BALANCE = 1_000_000
@@ -78,13 +84,14 @@ class Command(BaseCommand):
         monkeys = self._seed_monkeys(rng, stocks, options["monkeys"])
         order_count = self._seed_holdings_and_orders(rng, monkeys, stocks)
         snapshot_count = self._seed_snapshots(rng, monkeys)
-        tick_count = self._seed_ticks(rng)
+        tick_count, baseline_count = self._seed_index(rng)
 
         self.stdout.write(
             self.style.SUCCESS(
                 "Seeded "
                 f"{len(monkeys)} monkeys, {len(stocks)} stocks, {order_count} orders, "
-                f"{snapshot_count} daily snapshots, {tick_count} earning-ratio ticks."
+                f"{snapshot_count} daily snapshots, {tick_count} index ticks, "
+                f"{baseline_count} index baselines."
             )
         )
 
@@ -94,11 +101,12 @@ class Command(BaseCommand):
         Order.objects.all().delete()
         Holding.objects.all().delete()
         MonkeyDailySnapshot.objects.all().delete()
-        MonkeyEarningRatioTick.objects.all().delete()
+        MonkeyIndexTick.objects.all().delete()
+        MonkeyIndexBaseline.objects.all().delete()
         Monkey.objects.all().delete()
         Stock.objects.all().delete()
         self.stdout.write(
-            "Cleared existing monkeys, stocks, orders, snapshots and ticks."
+            "Cleared existing monkeys, stocks, orders, snapshots, ticks and baselines."
         )
 
     def _seed_control(self):
@@ -247,29 +255,54 @@ class Command(BaseCommand):
         MonkeyDailySnapshot.objects.bulk_create(snapshots)
         return len(snapshots)
 
-    def _seed_ticks(self, rng, days=6, step_minutes=5):
+    def _seed_index(self, rng, days=30, step_minutes=5):
+        """Seed Monkey Index ticks (a random walk around 10,000) and a daily
+        baseline per trading day, mirroring ``record_index_tick`` /
+        ``capture_index_baseline`` so the candlestick chart renders at every unit.
+        """
         tz = timezone.get_current_timezone()
         today = timezone.localdate()
-        walk = rng.uniform(-0.05, 0.05)
-        values = []
+        value = services.MONKEY_INDEX_BASE  # 10,000 cold-start
+        samples = []  # (recorded_at, value)
+        baselines = []  # MonkeyIndexBaseline rows
         for offset in range(days, -1, -1):
             day = today - timedelta(days=offset)
-            if day.weekday() >= 5:  # skip weekends
+            if day.weekday() >= 5:  # skip weekends (KRX closed)
                 continue
+            # base_index carries forward yesterday's close; base_equity is a
+            # plausible alive-equity figure (only its ratio to live equity matters).
+            baselines.append(
+                MonkeyIndexBaseline(
+                    date=day,
+                    base_index=round(value, 2),
+                    base_equity=round(value * 1000),
+                )
+            )
             cursor = datetime.combine(day, time(9, 0))
             end = datetime.combine(day, time(15, 30))
             while cursor <= end:
-                walk = max(-0.4, min(0.6, walk + rng.uniform(-0.008, 0.01)))
-                values.append((timezone.make_aware(cursor, tz), round(walk, 4)))
+                value = max(
+                    7000.0, min(14000.0, value * (1 + rng.uniform(-0.0009, 0.001)))
+                )
+                samples.append((timezone.make_aware(cursor, tz), round(value, 2)))
                 cursor += timedelta(minutes=step_minutes)
 
-        ticks = MonkeyEarningRatioTick.objects.bulk_create(
-            [MonkeyEarningRatioTick(average_earning_ratio=value) for _, value in values]
+        ticks = MonkeyIndexTick.objects.bulk_create(
+            [MonkeyIndexTick(value=value) for _, value in samples]
         )
-        for tick, (recorded_at, _) in zip(ticks, values):
+        for tick, (recorded_at, _) in zip(ticks, samples):
             tick.recorded_at = recorded_at
-        MonkeyEarningRatioTick.objects.bulk_update(ticks, ["recorded_at"])
-        return len(ticks)
+        MonkeyIndexTick.objects.bulk_update(ticks, ["recorded_at"])
+
+        for baseline in baselines:
+            MonkeyIndexBaseline.objects.update_or_create(
+                date=baseline.date,
+                defaults={
+                    "base_index": baseline.base_index,
+                    "base_equity": baseline.base_equity,
+                },
+            )
+        return len(ticks), len(baselines)
 
     # -- helpers -----------------------------------------------------------
 

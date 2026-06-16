@@ -99,12 +99,15 @@ CELERY_TASK_ROUTES = {
     "monkey.tasks.get_stock_price": {"queue": "kis_orders"},
     # market-open, low traffic but important
     "monkey.tasks.update_held_stock_prices": {"queue": "kis_maintenance"},
-    "monkey.tasks.liquidate_orphaned_holdings": {"queue": "kis_maintenance"},
     # runs while the market is closed
     "monkey.tasks.reconcile_executions": {"queue": "kis_offhours"},
     "monkey.tasks.update_token": {"queue": "kis_offhours"},
     "monkey.tasks.check_holiday": {"queue": "kis_offhours"},
     "monkey.tasks.auto_create_monkeys": {"queue": "kis_offhours"},
+    # Cull + reconcile/transfer (one KIS read + DB moves, no orders), runs while
+    # the market is closed — on the always-on default queue so on-demand/off-hours
+    # runs are actually consumed. Its lone KIS read is throttled by the global limiter.
+    "monkey.tasks.daily_maintenance": {"queue": "default"},
 }
 
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"

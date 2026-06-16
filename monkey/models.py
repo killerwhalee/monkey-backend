@@ -321,10 +321,43 @@ class MonkeyDailySnapshot(models.Model):
         )
 
 
-class MonkeyEarningRatioTick(models.Model):
-    """Per-minute sample of the average earning ratio across all monkeys.
+class MonkeyIndexBaseline(models.Model):
+    """Per-trading-day reference point for the chained Monkey Index.
 
-    Used to build a daily candlestick chart (open/high/low/close per day).
+    ``base_index`` is yesterday's closing index value (``i``); ``base_equity`` is
+    the summed equity of alive monkeys captured right before market open (``a``).
+    Each minute's index value is ``base_index * (current_equity / base_equity)``.
+    """
+
+    date = models.DateField(
+        "Trading date",
+        unique=True,
+    )
+    base_index = models.FloatField(
+        "Base index (yesterday's close)",
+    )
+    base_equity = models.BigIntegerField(
+        "Base equity (alive monkeys at open)",
+    )
+    created_at = models.DateTimeField(
+        "Created at",
+        auto_now_add=True,
+    )
+
+    class Meta:
+        ordering = ["date"]
+
+    def __str__(self):
+        return (
+            f"[{self.__class__.__name__} #{self.pk:04d}] "
+            f"{self.date} base_index={self.base_index} base_equity={self.base_equity}"
+        )
+
+
+class MonkeyIndexTick(models.Model):
+    """Per-minute sample of the Monkey Index value (base 10,000).
+
+    Used to build the candlestick chart (open/high/low/close per bucket).
     """
 
     recorded_at = models.DateTimeField(
@@ -332,8 +365,8 @@ class MonkeyEarningRatioTick(models.Model):
         auto_now_add=True,
         db_index=True,
     )
-    average_earning_ratio = models.FloatField(
-        "Average earning ratio",
+    value = models.FloatField(
+        "Index value",
     )
 
     class Meta:
@@ -342,5 +375,5 @@ class MonkeyEarningRatioTick(models.Model):
     def __str__(self):
         return (
             f"[{self.__class__.__name__} #{self.pk:04d}] "
-            f"{self.recorded_at} ratio={self.average_earning_ratio}"
+            f"{self.recorded_at} value={self.value}"
         )
