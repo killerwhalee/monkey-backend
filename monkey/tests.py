@@ -418,6 +418,24 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(holding.quantity, 2)
         self.assertEqual(Order.objects.count(), 0)
 
+    def test_reconcile_matches_prefixed_ticker_by_short_code(self):
+        # Ticker carries a prefix (e.g. ETN "Q610039") but KIS balance reports the
+        # bare 6-digit pdno ("610039"); reconciliation must match on short_code so
+        # the holding is neither absorbed nor clamped.
+        prefixed = Stock.objects.create(
+            market="KOSDAQ", ticker="Q610039", name="Some ETN"
+        )
+        self.assertEqual(prefixed.short_code, "610039")
+        monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey, stock=prefixed, quantity=4)
+
+        fake_client = FakeKisClient(price=100, holdings={"610039": 4})
+        result = services.reconcile_holdings(kis_client=fake_client)
+
+        self.assertEqual(result["absorbed"], [])
+        self.assertEqual(result["clamped"], [])
+        self.assertEqual(Holding.objects.get(monkey=monkey, stock=prefixed).quantity, 4)
+
     def test_daily_maintenance_transfers_delisted_to_system_monkey(self):
         delisted_stock = Stock.objects.create(
             market="KOSPI", ticker="999999", name="Delisted Co", is_active=False
