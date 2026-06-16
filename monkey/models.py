@@ -52,13 +52,13 @@ class GlobalMonkeyControl(models.Model):
     auto_create_min_interval_seconds = models.PositiveIntegerField(
         "New monkey min order interval (seconds)",
         default=60,
-        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        validators=[MinValueValidator(60), MaxValueValidator(7200)],
         help_text="Lower bound of the random order interval assigned to newly created monkeys.",
     )
     auto_create_max_interval_seconds = models.PositiveIntegerField(
         "New monkey max order interval (seconds)",
         default=1800,
-        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        validators=[MinValueValidator(60), MaxValueValidator(7200)],
         help_text="Upper bound of the random order interval assigned to newly created monkeys.",
     )
     created_at = models.DateTimeField(
@@ -83,9 +83,14 @@ class GlobalMonkeyControl(models.Model):
         ]
 
     @property
+    def market_open(self) -> bool:
+        """Physical market state: exchange is open regardless of manual gate."""
+        return self.time_enabled and self.holiday_enabled
+
+    @property
     def enabled(self) -> bool:
-        """Effective trading switch: every gate must be open."""
-        return self.time_enabled and self.holiday_enabled and self.manual_enabled
+        """Effective monkey trading switch: every gate must be open."""
+        return self.market_open and self.manual_enabled
 
     def clean(self):
         super().clean()
@@ -162,7 +167,7 @@ class Monkey(models.Model):
     order_interval_seconds = models.PositiveIntegerField(
         "Order interval (seconds)",
         default=60,
-        validators=[MinValueValidator(60), MaxValueValidator(1800)],
+        validators=[MinValueValidator(60), MaxValueValidator(7200)],
         help_text="How often this monkey places a random order.",
     )
     is_system = models.BooleanField(
