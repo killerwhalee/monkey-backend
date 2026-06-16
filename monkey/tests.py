@@ -419,22 +419,28 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(Order.objects.count(), 0)
 
     def test_reconcile_matches_prefixed_ticker_by_short_code(self):
-        # Ticker carries a prefix (e.g. ETN "Q610039") but KIS balance reports the
-        # bare 6-digit pdno ("610039"); reconciliation must match on short_code so
-        # the holding is neither absorbed nor clamped.
-        prefixed = Stock.objects.create(
-            market="KOSDAQ", ticker="Q610039", name="Some ETN"
+        # KIS strips the leading prefix char from tickers longer than 6 chars, so
+        # ETN "Q610039" reports as "610039" and warrant "J0669721F" as "0669721F".
+        # reconciliation must match on short_code so prefixed holdings are neither
+        # absorbed nor clamped.
+        etn = Stock.objects.create(market="KOSDAQ", ticker="Q610039", name="Some ETN")
+        warrant = Stock.objects.create(
+            market="KOSPI", ticker="J0669721F", name="Some warrant"
         )
-        self.assertEqual(prefixed.short_code, "610039")
-        monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
-        Holding.objects.create(monkey=monkey, stock=prefixed, quantity=4)
+        self.assertEqual(etn.short_code, "610039")
+        self.assertEqual(warrant.short_code, "0669721F")
 
-        fake_client = FakeKisClient(price=100, holdings={"610039": 4})
+        monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey, stock=etn, quantity=4)
+        Holding.objects.create(monkey=monkey, stock=warrant, quantity=7)
+
+        fake_client = FakeKisClient(price=100, holdings={"610039": 4, "0669721F": 7})
         result = services.reconcile_holdings(kis_client=fake_client)
 
         self.assertEqual(result["absorbed"], [])
         self.assertEqual(result["clamped"], [])
-        self.assertEqual(Holding.objects.get(monkey=monkey, stock=prefixed).quantity, 4)
+        self.assertEqual(Holding.objects.get(monkey=monkey, stock=etn).quantity, 4)
+        self.assertEqual(Holding.objects.get(monkey=monkey, stock=warrant).quantity, 7)
 
     def test_daily_maintenance_transfers_delisted_to_system_monkey(self):
         delisted_stock = Stock.objects.create(

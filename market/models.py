@@ -2,6 +2,17 @@ from django.core.validators import MinValueValidator
 from django.db import models
 
 
+def short_code_for(ticker):
+    """The 6+ digit code KIS reports holdings (pdno) by.
+
+    KIS strips the leading prefix character from tickers longer than 6 chars
+    (e.g. ETN "Q610039" -> "610039", warrant "J0669721F" -> "0669721F"); 6-char
+    tickers are returned unchanged.
+    """
+    ticker = ticker or ""
+    return ticker[1:] if len(ticker) > 6 else ticker
+
+
 class Stock(models.Model):
     """Stock info"""
 
@@ -15,12 +26,13 @@ class Stock(models.Model):
     )
     short_code = models.CharField(
         "Short code",
-        max_length=6,
+        max_length=16,
         blank=True,
         db_index=True,
         help_text=(
-            "Last 6 digits of the ticker (prefix stripped). KIS balance inquiries "
-            "return holdings by this 6-digit code, so reconciliation joins on it."
+            "Ticker with its leading prefix stripped when longer than 6 chars. "
+            "KIS balance inquiries return holdings (pdno) by this code, so "
+            "reconciliation joins on it."
         ),
     )
     name = models.CharField(
@@ -55,7 +67,7 @@ class Stock(models.Model):
     def save(self, *args, **kwargs):
         # Keep short_code in sync with ticker for every ORM save (bulk_create,
         # which bypasses this, sets it explicitly in market.tasks.update_market).
-        self.short_code = (self.ticker or "")[-6:]
+        self.short_code = short_code_for(self.ticker)
         super().save(*args, **kwargs)
 
     def __str__(self):
