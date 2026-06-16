@@ -6,6 +6,7 @@ import requests
 from celery import shared_task
 
 from market import models
+from market.models import short_code_for
 
 MARKET_CONFIG = {
     "kosdaq": {"url_name": "kosdaq_code", "offset": -222},
@@ -58,7 +59,7 @@ def update_market():
     # Convert to model instances. bulk_create bypasses Stock.save(), so derive
     # short_code (last 6 digits; KIS balance reports holdings by this) here.
     stock_instances = [
-        models.Stock(**data, is_active=True, short_code=data["ticker"][-6:])
+        models.Stock(**data, is_active=True, short_code=short_code_for(data["ticker"]))
         for data in all_stock_data
     ]
 
