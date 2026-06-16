@@ -17,7 +17,9 @@ class StockSerializer(serializers.ModelSerializer):
 
 class HoldingSerializer(serializers.ModelSerializer):
     stock = StockSerializer(read_only=True)
-    monkey_id = serializers.IntegerField(source="monkey.id", read_only=True)
+    # Read the FK column directly (`monkey_id`) rather than `monkey.id`, which
+    # would load the related Monkey per row and defeat list-endpoint prefetching.
+    monkey_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = models.Holding
@@ -31,7 +33,7 @@ class HoldingSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(serializers.ModelSerializer):
     stock = StockSerializer(read_only=True)
-    monkey_id = serializers.IntegerField(source="monkey.id", read_only=True)
+    monkey_id = serializers.IntegerField(read_only=True)
     monkey_name = serializers.CharField(source="monkey.name", read_only=True)
     order_type_label = serializers.CharField(
         source="get_order_type_display",
