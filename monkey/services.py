@@ -64,7 +64,12 @@ def sync_monkey_periodic_tasks():
     """
     from django_celery_beat.models import PeriodicTask, PeriodicTasks
 
-    gate_open = get_global_control().enabled
+    control = get_global_control()
+    monkey_active = control.enabled  # all three gates — governs actual monkey trading
+    market_open = (
+        control.market_open
+    )  # time + holiday only — governs market-hours tasks
+
     active_names = {
         f"monkey.run.{pk}"
         for pk in Monkey.objects.filter(state=Monkey.State.ACTIVE).values_list(
@@ -74,21 +79,22 @@ def sync_monkey_periodic_tasks():
 
     enabled_count = 0
     for task in PeriodicTask.objects.filter(task="monkey.tasks.run_monkey"):
-        desired = gate_open and task.name in active_names
+        desired = monkey_active and task.name in active_names
         if task.enabled != desired:
             PeriodicTask.objects.filter(pk=task.pk).update(enabled=desired)
         enabled_count += int(desired)
 
-    # Market-hours maintenance polling follows the gate too.
+    # These tasks are market-hours tasks: they run whenever the exchange is open,
+    # regardless of whether the manual kill-switch is set.
     PeriodicTask.objects.filter(name="monkey.update_held_stock_prices").update(
-        enabled=gate_open
+        enabled=market_open
     )
-    # The system monkey only liquidates its holdings while the market is open.
-    PeriodicTask.objects.filter(name="monkey.run_system").update(enabled=gate_open)
+    PeriodicTask.objects.filter(name="monkey.run_system").update(enabled=market_open)
+    PeriodicTask.objects.filter(name="monkey.index_tick").update(enabled=market_open)
 
     # Bulk .update() bypasses the post_save signal beat listens on — nudge it.
     PeriodicTasks.update_changed()
-    return {"gate_open": gate_open, "active_monkey_tasks": enabled_count}
+    return {"gate_open": monkey_active, "active_monkey_tasks": enabled_count}
 
 
 class ScheduleNotFoundError(Exception):
@@ -133,13 +139,42 @@ def list_task_schedules():
 
     rows = [
         _serialize_task_schedule(task)
-        for task in PeriodicTask.objects.filter(crontab__isnull=False).select_related(
-            "crontab"
-        )
+        for task in PeriodicTask.objects.filter(crontab__isnull=False)
+        .exclude(task="celery.backend_cleanup")
+        .select_related("crontab")
     ]
     # Ascending by scheduled time; any non-concrete time sorts last.
     rows.sort(key=lambda r: (r["hour"] is None, r["hour"] or 0, r["minute"] or 0))
     return rows
+
+
+def get_market_hours():
+    """Public-facing market schedule times derived from the crontab beat tasks.
+
+    Returns the concrete (hour, minute) for market open/close and the daily
+    holiday check so the dashboard can show live values instead of hard-coding
+    09:00/15:30/08:00. A value is ``None`` if the schedule is a range/wildcard.
+    """
+    from django_celery_beat.models import PeriodicTask
+
+    names = {
+        "open": "market.auto.open",
+        "close": "market.auto.close",
+        "holiday_check": "monkey.check_holiday",
+    }
+    tasks = {
+        task.name: task
+        for task in PeriodicTask.objects.filter(
+            name__in=names.values(), crontab__isnull=False
+        ).select_related("crontab")
+    }
+
+    result = {}
+    for key, name in names.items():
+        task = tasks.get(name)
+        hour, minute = _crontab_hour_minute(task.crontab) if task else (None, None)
+        result[key] = {"hour": hour, "minute": minute}
+    return result
 
 
 def set_task_schedule(task_id, hour, minute):
@@ -281,6 +316,8 @@ def kill_underperforming_monkeys() -> int:
 
 
 def snapshot_all_monkeys(target_date=None):
+    if get_global_control().market_open:
+        return {"skipped": "market_open"}
     # Deferred import: serializers.py does `from monkey import services`, so importing
     # build_monkey_metrics at module load time would create a circular import (same
     # pattern as the deferred `from market.models import Order` in monkey/kis.py).
@@ -378,8 +415,8 @@ def record_index_tick():
     """Sample the current Monkey Index value: ``base_index * (b / a)``. Gated on
     the global kill switch (mirrors run_monkey) so each day's ticks form a clean
     trading-session candle. Skips if today's baseline hasn't been captured yet."""
-    if not get_global_control().enabled:
-        return {"enabled": False}
+    if not get_global_control().market_open:
+        return {"market_open": False}
 
     baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
     if baseline is None:
@@ -467,8 +504,8 @@ def update_held_stock_prices(kis_client=None):
     polled during a live trading session. These prices feed holdings valuation,
     average-price/earning-rate breakdowns, and equity metrics.
     """
-    if not get_global_control().enabled:
-        return {"enabled": False}
+    if not get_global_control().market_open:
+        return {"market_open": False}
 
     kis_client = kis_client or KisClient()
     stock_ids = list(
@@ -500,8 +537,8 @@ def reconcile_order_executions(kis_client=None, lookback_days=1):
     and price so the FIFO average-price/earning-rate math reflects reality. Each
     order maps to one ODNO, so multiple buys/sells reconcile independently.
     """
-    if not get_global_control().enabled:
-        return {"enabled": False}
+    if get_global_control().market_open:
+        return {"skipped": "market_open"}
 
     kis_client = kis_client or KisClient()
     start = timezone.localdate() - timedelta(days=lookback_days)
@@ -542,7 +579,7 @@ def build_account_summary(kis_client=None):
     are still derived locally since they have no KIS equivalent.
     """
     kis_client = kis_client or KisClient()
-    balance = kis_client.get_account_balance()
+    balance = kis_client.get_account_balance(include_holdings=False)
 
     monkeys = list(Monkey.objects.filter(is_system=False))
     total_monkey_balance = sum(monkey.balance for monkey in monkeys)
@@ -566,7 +603,7 @@ def unallocated_cash(kis_client=None):
     excluded here, so their cash is freed back into circulation for new monkeys.
     """
     kis_client = kis_client or KisClient()
-    kis_cash = kis_client.get_account_balance()["cash_balance"]
+    kis_cash = kis_client.get_account_balance(include_holdings=False)["cash_balance"]
     allocated = (
         Monkey.objects.filter(is_system=False)
         .exclude(state=Monkey.State.DEAD)
@@ -1049,7 +1086,7 @@ def run_daily_maintenance():
     sell orders are placed here. The system monkey's own periodic task does the
     actual selling during market hours.
     """
-    if get_global_control().enabled:
+    if get_global_control().market_open:
         return {"skipped": "market_open"}
 
     killed = kill_underperforming_monkeys()

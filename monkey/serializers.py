@@ -32,9 +32,7 @@ class MonkeySerializer(serializers.ModelSerializer):
         read_only_fields = ["killed_at", "created_at"]
 
     def get_holdings(self, obj):
-        holdings = Holding.objects.filter(monkey=obj, quantity__gt=0).select_related(
-            "stock"
-        )
+        holdings = _holdings_for(obj, only_positive=True)
         breakdown = build_holdings_breakdown(obj)
         data = HoldingSerializer(holdings, many=True).data
         for row in data:
@@ -49,7 +47,7 @@ class MonkeySerializer(serializers.ModelSerializer):
     def get_recent_orders(self, obj):
         orders = (
             Order.objects.filter(monkey=obj)
-            .select_related("stock")
+            .select_related("monkey", "stock")
             .order_by("-created_at")[:10]
         )
         return OrderSerializer(orders, many=True).data
@@ -78,12 +76,14 @@ class IntervalScheduleUpdateSerializer(serializers.Serializer):
 
 
 class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
+    market_open = serializers.BooleanField(read_only=True)
     enabled = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = GlobalMonkeyControl
         fields = [
             "id",
+            "market_open",
             "enabled",
             "time_enabled",
             "holiday_enabled",
@@ -159,15 +159,55 @@ class DashboardSummarySerializer(serializers.Serializer):
     latest_orders = OrderSerializer(many=True)
 
 
+def _orders_by_stock(monkey):
+    """Succeeded orders grouped by ``stock_id``, ascending by (created_at, id).
+
+    Reuses the ``_succeeded_orders`` prefetch (set by ``MonkeyViewSet.get_queryset``
+    for list/retrieve) when present so the metrics/breakdown helpers run no extra
+    queries; otherwise queries once for this monkey.
+    """
+    prefetched = getattr(monkey, "_succeeded_orders", None)
+    if prefetched is None:
+        prefetched = (
+            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUCCEEDED)
+            .select_related("stock")
+            .order_by("created_at", "id")
+        )
+    grouped = {}
+    for order in prefetched:
+        grouped.setdefault(order.stock_id, []).append(order)
+    return grouped
+
+
+def _holdings_for(monkey, only_positive):
+    """Monkey holdings, reusing the ``_holdings`` prefetch when present.
+
+    ``build_monkey_metrics`` walks every holding (a zero-quantity row still
+    contributes its realized P&L); ``build_holdings_breakdown`` only wants
+    currently-held (>0) rows.
+    """
+    prefetched = getattr(monkey, "_holdings", None)
+    if prefetched is None:
+        qs = Holding.objects.filter(monkey=monkey).select_related("stock")
+        if only_positive:
+            qs = qs.filter(quantity__gt=0)
+        return list(qs)
+    if only_positive:
+        return [holding for holding in prefetched if holding.quantity > 0]
+    return list(prefetched)
+
+
 def build_monkey_metrics(monkey):
+    orders_by_stock = _orders_by_stock(monkey)
     holdings_value = 0
     unrealized_pl = 0
     realized_pl = 0
 
-    for holding in Holding.objects.filter(monkey=monkey).select_related("stock"):
-        price = _current_price(monkey, holding.stock)
+    for holding in _holdings_for(monkey, only_positive=False):
+        orders = orders_by_stock.get(holding.stock_id, [])
+        price = _current_price(holding.stock, orders)
         holdings_value += holding.quantity * price
-        basis, realized_for_stock = _stock_profit(monkey, holding.stock_id, price)
+        basis, realized_for_stock = _stock_profit(orders, price)
         unrealized_pl += holding.quantity * price - basis
         realized_pl += realized_for_stock
 
@@ -194,12 +234,12 @@ def build_holdings_breakdown(monkey):
     succeeded orders (handles repeated buys/sells); current price is the live
     Stock price (falling back to the last trade price when not yet polled).
     """
+    orders_by_stock = _orders_by_stock(monkey)
     breakdown = {}
-    for holding in Holding.objects.filter(monkey=monkey, quantity__gt=0).select_related(
-        "stock"
-    ):
-        current_price = _current_price(monkey, holding.stock)
-        cost_basis, _ = _stock_profit(monkey, holding.stock_id, current_price)
+    for holding in _holdings_for(monkey, only_positive=True):
+        orders = orders_by_stock.get(holding.stock_id, [])
+        current_price = _current_price(holding.stock, orders)
+        cost_basis, _ = _stock_profit(orders, current_price)
         average_price = round(cost_basis / holding.quantity) if holding.quantity else 0
         evaluation = holding.quantity * current_price
         profit = evaluation - cost_basis
@@ -214,38 +254,26 @@ def build_holdings_breakdown(monkey):
     return breakdown
 
 
-def _current_price(monkey, stock):
-    """Live price for a stock, falling back to the monkey's last trade price."""
+def _current_price(stock, orders):
+    """Live price for a stock, falling back to the last trade price among
+    ``orders`` (this stock's succeeded orders, ascending by created_at)."""
     if stock.current_price:
         return stock.current_price
-    return _latest_stock_price(monkey, stock.id)
+    return _latest_stock_price(orders)
 
 
-def _latest_stock_price(monkey, stock_id):
-    order = (
-        Order.objects.filter(
-            monkey=monkey,
-            stock_id=stock_id,
-            status=Order.StatusChoices.SUCCEEDED,
-        )
-        .exclude(estimated_price__isnull=True)
-        .order_by("-created_at")
-        .first()
-    )
-    if not order:
-        return 0
-    return order.executed_price or order.estimated_price or 0
+def _latest_stock_price(orders):
+    # `orders` is ascending; the most recent order with a usable price wins.
+    for order in reversed(orders):
+        if order.estimated_price is not None:
+            return order.executed_price or order.estimated_price or 0
+    return 0
 
 
-def _stock_profit(monkey, stock_id, current_price):
+def _stock_profit(orders, current_price):
     quantity = 0
     cost_basis = 0
     realized_pl = 0
-    orders = Order.objects.filter(
-        monkey=monkey,
-        stock_id=stock_id,
-        status=Order.StatusChoices.SUCCEEDED,
-    ).order_by("created_at", "id")
 
     for order in orders:
         price = order.executed_price or order.estimated_price or current_price

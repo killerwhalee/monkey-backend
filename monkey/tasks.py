@@ -33,8 +33,8 @@ def run_monkey(monkey_id):
 
 @shared_task
 def run_system_monkey():
-    if not services.get_global_control().enabled:
-        return {"enabled": False}
+    if not services.get_global_control().market_open:
+        return {"market_open": False}
     order = services.run_system_monkey_order()
     if order is None:
         return {"enabled": True, "order_id": None}
@@ -77,6 +77,8 @@ def daily_maintenance():
 
 @shared_task
 def auto_create_monkeys():
+    if services.get_global_control().market_open:
+        return {"skipped": "market_open"}
     monkeys = services.auto_create_monkeys()
     return {"created": [monkey.id for monkey in monkeys]}
 

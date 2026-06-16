@@ -1,7 +1,9 @@
+from django.db.models import Prefetch
 from rest_framework import permissions, status, views, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from market.models import Holding, Order
 from monkey import serializers, services
 from monkey.models import GlobalMonkeyControl, KisAccessToken, Monkey
 from monkey.task_catalog import TASK_CATALOG, TASK_MAP
@@ -18,6 +20,29 @@ class MonkeyViewSet(viewsets.ModelViewSet):
     queryset = Monkey.objects.filter(is_system=False).order_by("id")
     serializer_class = serializers.MonkeySerializer
     permission_classes = [IsAdminOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Read paths serialize per-monkey metrics/holdings; prefetch holdings and
+        # succeeded orders once so the helpers run no per-monkey/per-stock queries.
+        # Excluded for mutating actions (e.g. force-kill) so the response reflects
+        # post-mutation state rather than a stale prefetch.
+        if self.action in ("list", "retrieve", "summary"):
+            qs = qs.prefetch_related(
+                Prefetch(
+                    "holding_set",
+                    queryset=Holding.objects.select_related("stock"),
+                    to_attr="_holdings",
+                ),
+                Prefetch(
+                    "orders",
+                    queryset=Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+                    .select_related("stock")
+                    .order_by("created_at", "id"),
+                    to_attr="_succeeded_orders",
+                ),
+            )
+        return qs
 
     @action(
         detail=False,
@@ -50,16 +75,6 @@ class MonkeyViewSet(viewsets.ModelViewSet):
         except services.KillNotAllowedError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(self.get_serializer(monkey).data)
-
-    @action(
-        detail=False,
-        methods=["post"],
-        permission_classes=[permissions.IsAdminUser],
-        url_path="auto-create",
-    )
-    def auto_create(self, request):
-        monkeys = services.auto_create_monkeys()
-        return Response(serializers.MonkeySerializer(monkeys, many=True).data)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -99,6 +114,16 @@ class GlobalMonkeyControlViewSet(viewsets.ModelViewSet):
             serializer.save()
             return Response(serializer.data)
         return Response(self.get_serializer(control).data)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="market-hours",
+        permission_classes=[permissions.AllowAny],
+    )
+    def market_hours(self, request):
+        """Public market open/close/holiday-check times (from the beat schedule)."""
+        return Response(services.get_market_hours())
 
     @action(
         detail=False,

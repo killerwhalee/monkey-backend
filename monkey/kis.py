@@ -138,47 +138,82 @@ class KisClient:
             raise KisClientError("KIS price response did not include current price.")
         return int(raw_price)
 
-    def get_account_balance(self):
-        data = self._get(
-            "/uapi/domestic-stock/v1/trading/inquire-balance",
-            self.BALANCE_TR_ID,
-            {
-                "CANO": self.account_number,
-                "ACNT_PRDT_CD": self.account_product_code,
-                "AFHR_FLPR_YN": "N",
-                "OFL_YN": "",
-                "INQR_DVSN": "02",
-                "UNPR_DVSN": "01",
-                "FUND_STTL_ICLD_YN": "N",
-                "FNCG_AMT_AUTO_RDPT_YN": "N",
-                "PRCS_DVSN": "00",
-                "CTX_AREA_FK100": "",
-                "CTX_AREA_NK100": "",
-            },
-        )
+    def get_account_balance(self, include_holdings=True):
+        """Fetch the KIS account snapshot.
+
+        ``output2`` (cash/equity summary) is identical on every page, so when only
+        the summary numbers are needed (``include_holdings=False``) we read a single
+        page and skip pagination entirely. Paper trading returns just 20 holdings
+        per page, so paginating an account with hundreds of holdings — each request
+        throttled ~1/sec — is slow; callers that don't need the holdings dict (the
+        account-summary view, unallocated-cash) should pass ``include_holdings=False``.
+        """
+
         # An empty paper account ("모의투자 잔고내역이 없습니다") is a normal,
         # benign response — surface it as zero cash / no holdings, never an error.
-        summary = (data.get("output2") or [{}])[0] or {}
-
         def _to_float(value):
             try:
                 return float(value)
             except (TypeError, ValueError):
                 return 0.0
 
+        summary = {}
+        holdings = {}
+        ctx_fk = ""
+        ctx_nk = ""
+        tr_cont = ""
+        for _ in range(50):  # hard cap against a malformed continuation loop
+            response = self._execute(
+                "GET",
+                f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
+                headers={**self._headers(self.BALANCE_TR_ID), "tr_cont": tr_cont},
+                params={
+                    "CANO": self.account_number,
+                    "ACNT_PRDT_CD": self.account_product_code,
+                    "AFHR_FLPR_YN": "N",
+                    "OFL_YN": "",
+                    "INQR_DVSN": "02",
+                    "UNPR_DVSN": "01",
+                    "FUND_STTL_ICLD_YN": "N",
+                    "FNCG_AMT_AUTO_RDPT_YN": "N",
+                    "PRCS_DVSN": "00",
+                    "CTX_AREA_FK100": ctx_fk,
+                    "CTX_AREA_NK100": ctx_nk,
+                },
+            )
+            data = response.json()
+
+            if not summary:
+                summary = (data.get("output2") or [{}])[0] or {}
+
+            if not include_holdings:
+                # Summary lives in output2 (page-invariant); skip the holdings pages.
+                break
+
+            for item in data.get("output1") or []:
+                qty = int(item.get("hldg_qty") or 0)
+                if qty > 0:
+                    holdings[item["pdno"]] = qty
+
+            tr_cont = response.headers.get("tr_cont", "")
+            if tr_cont not in ("F", "M"):
+                break
+            ctx_fk = data.get("ctx_area_fk100", "")
+            ctx_nk = data.get("ctx_area_nk100", "")
+
         return {
-            "cash_balance": int(summary.get("dnca_tot_amt") or 0),
+            # prvs_rcdl_excc_amt (D+2 가수도정산금액) is the fully-settled cash
+            # position once all pending buy/sell transactions clear. Using D+0
+            # (dnca_tot_amt) risks over-counting cash that isn't yet settled,
+            # which could cause auto_create_monkeys to allocate more than available.
+            "cash_balance": int(summary.get("prvs_rcdl_excc_amt") or 0),
             "securities_value": int(summary.get("scts_evlu_amt") or 0),
             "total_assets": int(summary.get("tot_evlu_amt") or 0),
             "total_pl": int(summary.get("evlu_pfls_smtl_amt") or 0),
             # asst_icdc_erng_rt is a percentage figure (e.g. "1.23"); expose it as
             # a fraction so the frontend can format it like the monkey ratios.
             "earning_rate": _to_float(summary.get("asst_icdc_erng_rt")) / 100.0,
-            "holdings": {
-                item["pdno"]: int(item.get("hldg_qty") or 0)
-                for item in (data.get("output1") or [])
-                if int(item.get("hldg_qty") or 0) > 0
-            },
+            "holdings": holdings,
         }
 
     def is_holiday(self, date=None):
