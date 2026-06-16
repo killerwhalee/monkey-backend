@@ -1003,7 +1003,7 @@ def _absorb_excess(ticker, excess_qty):
     Assign the excess to the hidden system monkey; its periodic task sells it off
     later, so nothing is liquidated here.
     """
-    stock = Stock.objects.filter(ticker=ticker).order_by(
+    stock = Stock.objects.filter(short_code=ticker).order_by(
         "id"
     ).first() or _placeholder_stock(ticker)
     system_monkey = get_or_create_system_monkey()
@@ -1029,7 +1029,7 @@ def _clamp_phantom_holdings(ticker, phantom_qty):
     remaining = phantom_qty
     affected = []
     for holding in Holding.objects.filter(
-        stock__ticker=ticker, quantity__gt=0
+        stock__short_code=ticker, quantity__gt=0
     ).order_by("-quantity"):
         if remaining <= 0:
             break
@@ -1054,23 +1054,26 @@ def reconcile_holdings(kis_client=None):
     local ledger overcounts reality) is clamped down to match reality.
     """
     kis_client = kis_client or KisClient()
+    # KIS reports holdings keyed by the 6-digit pdno, so join the local ledger on
+    # Stock.short_code (last 6 digits) — tickers may carry a prefix (e.g. Q610039)
+    # that the pdno omits, which would otherwise never match.
     real = kis_client.get_account_balance()["holdings"]
     local = dict(
         Holding.objects.filter(quantity__gt=0)
-        .values("stock__ticker")
+        .values("stock__short_code")
         .annotate(total=Sum("quantity"))
-        .values_list("stock__ticker", "total")
+        .values_list("stock__short_code", "total")
     )
 
     absorbed = []
     clamped = []
-    for ticker in set(real) | set(local):
-        real_qty = real.get(ticker, 0)
-        local_qty = local.get(ticker, 0)
+    for code in set(real) | set(local):
+        real_qty = real.get(code, 0)
+        local_qty = local.get(code, 0)
         if real_qty > local_qty:
-            absorbed.append(_absorb_excess(ticker, real_qty - local_qty))
+            absorbed.append(_absorb_excess(code, real_qty - local_qty))
         elif local_qty > real_qty:
-            clamped.append(_clamp_phantom_holdings(ticker, local_qty - real_qty))
+            clamped.append(_clamp_phantom_holdings(code, local_qty - real_qty))
 
     return {"absorbed": absorbed, "clamped": clamped}
 

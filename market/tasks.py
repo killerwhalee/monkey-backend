@@ -55,15 +55,19 @@ def update_market():
         for market in MARKET_CONFIG:
             all_stock_data.extend(download_and_parse_market(tmp_dir, market))
 
-    # Convert to model instances
-    stock_instances = [models.Stock(**data, is_active=True) for data in all_stock_data]
+    # Convert to model instances. bulk_create bypasses Stock.save(), so derive
+    # short_code (last 6 digits; KIS balance reports holdings by this) here.
+    stock_instances = [
+        models.Stock(**data, is_active=True, short_code=data["ticker"][-6:])
+        for data in all_stock_data
+    ]
 
     # UPSERT based on the composite unique key
     models.Stock.objects.bulk_create(
         stock_instances,
         update_conflicts=True,
         unique_fields=["ticker", "market"],
-        update_fields=["name", "is_active"],  # Fields to update on conflict
+        update_fields=["name", "is_active", "short_code"],  # Updated on conflict
     )
 
     # Tickers absent from the fresh download are no longer listed.

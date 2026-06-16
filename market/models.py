@@ -13,6 +13,16 @@ class Stock(models.Model):
         "Stock ticker",
         max_length=16,
     )
+    short_code = models.CharField(
+        "Short code",
+        max_length=6,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "Last 6 digits of the ticker (prefix stripped). KIS balance inquiries "
+            "return holdings by this 6-digit code, so reconciliation joins on it."
+        ),
+    )
     name = models.CharField(
         "Stock name",
         max_length=256,
@@ -41,6 +51,12 @@ class Stock(models.Model):
                 name="unique_ticker_per_market",
             )
         ]
+
+    def save(self, *args, **kwargs):
+        # Keep short_code in sync with ticker for every ORM save (bulk_create,
+        # which bypasses this, sets it explicitly in market.tasks.update_market).
+        self.short_code = (self.ticker or "")[-6:]
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return (
