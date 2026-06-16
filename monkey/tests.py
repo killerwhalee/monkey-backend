@@ -2,7 +2,9 @@ from datetime import date, timedelta
 from unittest import mock
 
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -41,7 +43,7 @@ class FakeKisClient:
     def get_stock_price(self, ticker):
         return self.price
 
-    def get_account_balance(self):
+    def get_account_balance(self, include_holdings=True):
         return {"cash_balance": self.balance, "holdings": self.holdings}
 
     def is_holiday(self, date=None):
@@ -733,16 +735,18 @@ class MonkeyApiTests(APITestCase):
         response = self.client.get(reverse("global-monkey-control-tasks"))
         self.assertEqual(response.status_code, 200)
         names = {entry["name"] for entry in response.data}
-        self.assertIn("run_monkeys", names)
+        self.assertIn("daily_maintenance", names)
         # Every entry carries a Korean label + description for the UI.
         self.assertTrue(
             all(entry["label"] and entry["description"] for entry in response.data)
         )
         # Dangerous tasks expose a non-empty warnings list; safe ones don't.
         by_name = {entry["name"]: entry for entry in response.data}
-        self.assertTrue(by_name["run_monkeys"]["dangerous"])
-        self.assertTrue(len(by_name["run_monkeys"]["warnings"]) >= 1)
-        self.assertEqual(by_name["run_monkeys"]["task"], "monkey.tasks.run_monkeys")
+        self.assertTrue(by_name["daily_maintenance"]["dangerous"])
+        self.assertTrue(len(by_name["daily_maintenance"]["warnings"]) >= 1)
+        self.assertEqual(
+            by_name["daily_maintenance"]["task"], "monkey.tasks.daily_maintenance"
+        )
         self.assertFalse(by_name["snapshot_monkeys"]["dangerous"])
         self.assertEqual(by_name["snapshot_monkeys"]["warnings"], [])
 
@@ -751,15 +755,17 @@ class MonkeyApiTests(APITestCase):
             username="admin", password="pw", is_staff=True
         )
         self.client.force_authenticate(user)
-        with mock.patch("monkey.task_catalog.monkey_tasks.run_monkeys.delay") as delay:
+        with mock.patch(
+            "monkey.task_catalog.monkey_tasks.daily_maintenance.delay"
+        ) as delay:
             delay.return_value = mock.Mock(id="abc-123")
             response = self.client.post(
                 reverse("global-monkey-control-run-task"),
-                {"task": "run_monkeys"},
+                {"task": "daily_maintenance"},
                 format="json",
             )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data, {"task": "run_monkeys", "id": "abc-123"})
+        self.assertEqual(response.data, {"task": "daily_maintenance", "id": "abc-123"})
         delay.assert_called_once_with()
 
     def test_run_task_rejects_unknown_task(self):
@@ -1269,7 +1275,7 @@ class HoldingsBreakdownTests(TestCase):
     def test_update_held_stock_prices_gated_on_global_switch(self):
         Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=2)
         result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
-        self.assertEqual(result, {"enabled": False})
+        self.assertEqual(result, {"market_open": False})
 
 
 class ExecutionReconciliationTests(TestCase):
@@ -1283,6 +1289,8 @@ class ExecutionReconciliationTests(TestCase):
         services.set_trading_enabled(True)
 
     def test_reconcile_corrects_executed_price_and_quantity(self):
+        # Reconciliation is a market-closed task; setUp opened the gate.
+        services.set_trading_enabled(False)
         order = Order.objects.create(
             monkey=self.monkey,
             stock=self.stock,
@@ -1304,9 +1312,10 @@ class ExecutionReconciliationTests(TestCase):
         self.assertEqual(order.executed_price, 1050)
 
     def test_reconcile_gated_on_global_switch(self):
-        services.set_trading_enabled(False)
+        # Reconciliation skips while the market is open (runs after close).
+        services.set_trading_enabled(True)
         result = services.reconcile_order_executions(kis_client=FakeKisClient())
-        self.assertEqual(result, {"enabled": False})
+        self.assertEqual(result, {"skipped": "market_open"})
 
 
 class CandlestickApiTests(APITestCase):
@@ -1370,7 +1379,7 @@ class MonkeyIndexTests(TestCase):
 
     def test_record_tick_is_gated(self):
         services.set_trading_enabled(False)
-        self.assertEqual(services.record_index_tick(), {"enabled": False})
+        self.assertEqual(services.record_index_tick(), {"market_open": False})
 
     def test_record_tick_skips_without_baseline(self):
         services.set_trading_enabled(True)
@@ -1545,3 +1554,48 @@ class KisTransientRetryTests(TestCase):
             KisClient().refresh_access_token()
         # KIS_MAX_RETRIES (3) + 1 initial attempt
         self.assertEqual(post.call_count, 4)
+
+
+class MonkeyListQueryCountTests(APITestCase):
+    """The monkey list serializes per-monkey metrics + holdings breakdown. These
+    are batched via prefetch in MonkeyViewSet.get_queryset, so the query count
+    must not grow with the number of *stocks* each monkey holds (the old N+1)."""
+
+    def _give_holdings(self, monkey, stocks):
+        for stock in stocks:
+            Holding.objects.create(monkey=monkey, stock=stock, quantity=2)
+            Order.objects.create(
+                monkey=monkey,
+                stock=stock,
+                order_type=Order.OrderTypeChoices.BUY,
+                status=Order.StatusChoices.SUCCEEDED,
+                requested_quantity=2,
+                executed_quantity=2,
+                estimated_price=500,
+                executed_price=500,
+            )
+
+    def _count_list_queries(self):
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(reverse("monkey-list"))
+        self.assertEqual(response.status_code, 200)
+        return len(ctx.captured_queries)
+
+    def test_list_query_count_independent_of_holdings_per_monkey(self):
+        stocks = [
+            Stock.objects.create(market="KOSPI", ticker=f"00000{i}", name=f"S{i}")
+            for i in range(5)
+        ]
+        monkey_a = Monkey.objects.create(name="A", balance=1000, initial_balance=10000)
+        monkey_b = Monkey.objects.create(name="B", balance=1000, initial_balance=10000)
+
+        # Each monkey holds a single stock.
+        self._give_holdings(monkey_a, stocks[:1])
+        self._give_holdings(monkey_b, stocks[:1])
+        baseline = self._count_list_queries()
+
+        # Now each monkey holds five stocks. With prefetching, the per-stock FIFO
+        # work adds no queries, so the total is unchanged.
+        self._give_holdings(monkey_a, stocks[1:])
+        self._give_holdings(monkey_b, stocks[1:])
+        self.assertEqual(self._count_list_queries(), baseline)
