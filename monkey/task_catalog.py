@@ -28,10 +28,17 @@ RUNNABLE_TASKS = [
     (
         "liquidate_orphaned_holdings",
         monkey_tasks.liquidate_orphaned_holdings,
-        "미아 보유분 청산",
-        "제거된 원숭이가 남긴 보유 종목을 매도합니다.",
+        "미아 보유분 정리",
+        "보유 현황을 점검하여 미아·상장폐지·폐사 보유분을 시스템 원숭이로 이관합니다.",
+        [],
+    ),
+    (
+        "run_system_monkey",
+        monkey_tasks.run_system_monkey,
+        "시스템 원숭이 청산 실행",
+        "시스템 원숭이가 보유한 종목 중 하나를 무작위로 골라 전량 매도합니다.",
         [
-            "폐사한 원숭이가 남긴 보유 종목을 시장가로 매도합니다.",
+            "시스템 원숭이가 보유한 종목을 시장가로 전량 매도합니다.",
             "실제 KIS 계좌로 매도 주문이 전송됩니다.",
         ],
     ),

@@ -291,7 +291,7 @@ class MonkeyServiceTests(TestCase):
         for monkey in (first, second, third):
             self.assertTrue(60 <= monkey.order_interval_seconds <= 1800)
 
-    def test_kill_monkey_liquidates_all_holdings(self):
+    def test_kill_monkey_transfers_holdings_to_system_monkey(self):
         services.set_trading_enabled(True)
 
         monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
@@ -301,39 +301,36 @@ class MonkeyServiceTests(TestCase):
         Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
         Holding.objects.create(monkey=monkey, stock=other_stock, quantity=3)
 
-        with mock.patch(
-            "monkey.services.KisClient", return_value=FakeKisClient(price=100)
-        ):
-            services.kill_monkey(monkey)
+        services.kill_monkey(monkey)
 
         monkey.refresh_from_db()
         self.assertFalse(monkey.is_active)
         self.assertIsNotNone(monkey.killed_at)
-        self.assertFalse(
-            Holding.objects.filter(monkey=monkey, stock=self.stock).exists()
+        # No selling happens here; holdings move to the system monkey instead.
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
+        self.assertFalse(Order.objects.exists())
+        system_monkey = Monkey.objects.get(is_system=True)
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 2
         )
-        self.assertFalse(
-            Holding.objects.filter(monkey=monkey, stock=other_stock).exists()
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=other_stock).quantity, 3
         )
-        sell_orders = Order.objects.filter(
-            monkey=monkey,
-            order_type=Order.OrderTypeChoices.SELL,
-            status=Order.StatusChoices.SUCCEEDED,
-        )
-        self.assertEqual(sell_orders.count(), 2)
 
-    def test_kill_monkey_rejected_when_trading_disabled(self):
+    def test_kill_monkey_allowed_when_trading_disabled(self):
+        # Killing only moves holdings (DB-only), so it no longer needs the gate.
         monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
         Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
 
-        with self.assertRaises(services.KillNotAllowedError):
-            services.kill_monkey(monkey)
+        services.kill_monkey(monkey)
 
         monkey.refresh_from_db()
-        self.assertTrue(monkey.is_active)
-        self.assertIsNone(monkey.killed_at)
+        self.assertFalse(monkey.is_active)
+        self.assertIsNotNone(monkey.killed_at)
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
+        system_monkey = Monkey.objects.get(is_system=True)
         self.assertEqual(
-            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 2
+            Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 2
         )
 
     def test_auto_create_monkeys_uses_kis_cash_balance(self):
@@ -383,7 +380,7 @@ class OrphanedHoldingsTests(TestCase):
             market="KOSPI", ticker="005930", name="Samsung Electronics"
         )
 
-    def test_reconcile_holdings_absorbs_excess_into_system_monkey_and_sells(self):
+    def test_reconcile_holdings_absorbs_excess_into_system_monkey(self):
         fake_client = FakeKisClient(price=100, holdings={"005930": 5})
 
         result = services.reconcile_holdings(kis_client=fake_client)
@@ -394,15 +391,12 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(absorbed["quantity"], 5)
         self.assertEqual(result["clamped"], [])
 
+        # Excess is parked on the system monkey, not sold; its own task does that.
         system_monkey = Monkey.objects.get(is_system=True)
-        self.assertFalse(
-            Holding.objects.filter(monkey=system_monkey, stock=self.stock).exists()
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 5
         )
-
-        order = Order.objects.get(id=absorbed["order_ids"][0])
-        self.assertEqual(order.order_type, Order.OrderTypeChoices.SELL)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
-        self.assertEqual(order.executed_quantity, 5)
+        self.assertFalse(Order.objects.exists())
 
     def test_reconcile_holdings_clamps_phantom_holdings(self):
         monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
@@ -422,9 +416,7 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(holding.quantity, 2)
         self.assertEqual(Order.objects.count(), 0)
 
-    def test_liquidate_orphaned_holdings_only_targets_delisted_stocks(self):
-        services.set_trading_enabled(True)
-
+    def test_liquidate_orphaned_holdings_transfers_delisted_to_system_monkey(self):
         delisted_stock = Stock.objects.create(
             market="KOSPI", ticker="999999", name="Delisted Co", is_active=False
         )
@@ -437,17 +429,24 @@ class OrphanedHoldingsTests(TestCase):
         with mock.patch("monkey.services.KisClient", return_value=fake_client):
             result = services.liquidate_orphaned_holdings()
 
-        self.assertTrue(result["enabled"])
-        self.assertEqual(result["delisted_orders"], 1)
+        self.assertEqual(result["delisted_transfers"], 1)
+        # Active-stock holding is untouched; delisted one moves to the system monkey.
         self.assertEqual(
             Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 2
         )
         self.assertFalse(
             Holding.objects.filter(monkey=monkey, stock=delisted_stock).exists()
         )
+        system_monkey = Monkey.objects.get(is_system=True)
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=delisted_stock).quantity,
+            1,
+        )
+        self.assertFalse(Order.objects.exists())
 
-    def test_liquidate_orphaned_holdings_sells_killed_monkey_holdings(self):
-        services.set_trading_enabled(True)
+    def test_liquidate_orphaned_holdings_runs_with_gate_closed(self):
+        # No selling happens here, so it must work even when trading is disabled.
+        services.set_trading_enabled(False)
 
         killed = Monkey.objects.create(
             name="Z", balance=0, initial_balance=1000, state=Monkey.State.DEAD
@@ -459,9 +458,49 @@ class OrphanedHoldingsTests(TestCase):
         with mock.patch("monkey.services.KisClient", return_value=fake_client):
             result = services.liquidate_orphaned_holdings()
 
-        self.assertEqual(result["killed_orders"], 1)
+        self.assertEqual(result["killed_transfers"], 1)
         self.assertFalse(
             Holding.objects.filter(monkey=killed, stock=self.stock).exists()
+        )
+        system_monkey = Monkey.objects.get(is_system=True)
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 3
+        )
+
+    def test_run_system_monkey_order_sells_full_quantity_and_keeps_zero_balance(self):
+        system_monkey = services.get_or_create_system_monkey()
+        Holding.objects.create(monkey=system_monkey, stock=self.stock, quantity=4)
+        fake_client = FakeKisClient(price=100)
+
+        order = services.run_system_monkey_order(kis_client=fake_client)
+
+        self.assertEqual(order.order_type, Order.OrderTypeChoices.SELL)
+        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.executed_quantity, 4)
+        self.assertFalse(
+            Holding.objects.filter(monkey=system_monkey, stock=self.stock).exists()
+        )
+        # The system monkey never retains the sale proceeds.
+        system_monkey.refresh_from_db()
+        self.assertEqual(system_monkey.balance, 0)
+
+    def test_run_system_monkey_order_no_holdings_is_noop(self):
+        services.get_or_create_system_monkey()
+
+        self.assertIsNone(services.run_system_monkey_order(kis_client=FakeKisClient()))
+        self.assertFalse(Order.objects.exists())
+
+    def test_transfer_holdings_merges_into_existing_system_holding(self):
+        system_monkey = services.get_or_create_system_monkey()
+        Holding.objects.create(monkey=system_monkey, stock=self.stock, quantity=1)
+        monkey = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+
+        services.transfer_holdings_to_system_monkey(monkey)
+
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
+        self.assertEqual(
+            Holding.objects.get(monkey=system_monkey, stock=self.stock).quantity, 3
         )
 
 
@@ -531,8 +570,14 @@ class MonkeyApiTests(APITestCase):
         self.assertIsNotNone(monkey.killed_at)
         self.assertFalse(Holding.objects.filter(monkey=monkey, stock=stock).exists())
 
-    def test_force_kill_endpoint_rejected_when_trading_disabled(self):
+    def test_force_kill_endpoint_allowed_when_trading_disabled(self):
+        # Killing now only transfers holdings to the system monkey, so the
+        # endpoint succeeds even while trading is disabled.
+        stock = Stock.objects.create(
+            market="KOSPI", ticker="005930", name="Samsung Electronics"
+        )
         monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        Holding.objects.create(monkey=monkey, stock=stock, quantity=2)
 
         user = get_user_model().objects.create_user(
             username="admin", password="pw", is_staff=True
@@ -541,11 +586,11 @@ class MonkeyApiTests(APITestCase):
 
         response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
 
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("detail", response.data)
+        self.assertEqual(response.status_code, 200)
         monkey.refresh_from_db()
-        self.assertTrue(monkey.is_active)
-        self.assertIsNone(monkey.killed_at)
+        self.assertFalse(monkey.is_active)
+        self.assertIsNotNone(monkey.killed_at)
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
 
     def test_system_monkey_excluded_from_dashboard_and_monkey_list(self):
         system_monkey = services.get_or_create_system_monkey()

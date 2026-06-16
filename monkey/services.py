@@ -78,6 +78,8 @@ def sync_monkey_periodic_tasks():
     PeriodicTask.objects.filter(name="monkey.update_held_stock_prices").update(
         enabled=gate_open
     )
+    # The system monkey only liquidates its holdings while the market is open.
+    PeriodicTask.objects.filter(name="monkey.run_system").update(enabled=gate_open)
 
     # Bulk .update() bypasses the post_save signal beat listens on — nudge it.
     PeriodicTasks.update_changed()
@@ -240,15 +242,14 @@ class KillNotAllowedError(Exception):
 
 def kill_monkey(monkey: Monkey) -> Monkey:
     """
-    Deactivate a monkey and liquidate all of its holdings. Single path for both
-    auto-kill (maybe_kill_monkey) and admin force-kill.
-    The Monkey.save() override will automatically sync PeriodicTask.enabled=False.
+    Kill a monkey: hand its holdings to the system monkey and mark it DEAD. Single
+    path for both auto-kill (maybe_kill_monkey) and admin force-kill.
+
+    Holdings are *transferred* (DB-only) to the system monkey, which liquidates
+    them later via its own periodic task — so killing no longer requires the market
+    to be open. The Monkey.save() override drops the dead monkey's PeriodicTask.
     """
-    if not get_global_control().enabled:
-        raise KillNotAllowedError(
-            "거래가 비활성화되어 있어 보유 종목을 매도할 수 없으므로 원숭이를 제거할 수 없습니다."
-        )
-    liquidate_holdings_for_monkey(monkey)
+    transfer_holdings_to_system_monkey(monkey)
     monkey.state = Monkey.State.DEAD
     monkey.killed_at = timezone.now()
     monkey.save(update_fields=["state", "killed_at"])
@@ -646,6 +647,34 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
     return order
 
 
+def run_system_monkey_order(kis_client=None, rng=None):
+    """Sell off one random system-monkey holding (full quantity) through KIS.
+
+    The system monkey gradually liquidates the orphaned/dead-monkey holdings handed
+    to it. It never buys and never dies, and its sale proceeds are not retained (see
+    _apply_confirmed_order) — freed cash returns to the unallocated pool. Returns
+    None when it has nothing to sell.
+    """
+    rng = rng or random
+    system_monkey = get_or_create_system_monkey()
+    holdings = list(
+        Holding.objects.filter(monkey=system_monkey, quantity__gt=0).select_related(
+            "stock"
+        )
+    )
+    if not holdings:
+        return None
+
+    holding = rng.choice(holdings)
+    return submit_monkey_order(
+        monkey_id=system_monkey.id,
+        stock_id=holding.stock_id,
+        order_type=Order.OrderTypeChoices.SELL,
+        quantity=holding.quantity,
+        kis_client=kis_client,
+    )
+
+
 def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=None):
     """Place one order through KIS and keep the local ledger consistent.
 
@@ -776,8 +805,12 @@ def _apply_confirmed_order(
                     holding.quantity += quantity
                     holding.save(update_fields=["quantity"])
                 else:
-                    monkey.balance += total_price
-                    monkey.save(update_fields=["balance"])
+                    # The system monkey never retains cash: its sale proceeds are
+                    # left in the account as unallocated funds, so skip the balance
+                    # credit and keep its balance at 0.
+                    if not monkey.is_system:
+                        monkey.balance += total_price
+                        monkey.save(update_fields=["balance"])
                     holding = (
                         Holding.objects.select_for_update()
                         .filter(monkey=monkey, stock_id=stock_id)
@@ -846,33 +879,49 @@ def get_or_create_system_monkey():
     return monkey
 
 
-def liquidate_holdings_for_monkey(monkey, stock_ids=None, kis_client=None):
-    """Sell off a monkey's holdings via the normal order pipeline.
+def transfer_holdings_to_system_monkey(monkey, stock_ids=None):
+    """Reassign a monkey's holdings to the hidden system monkey (DB-only, no KIS).
 
-    Shared by system-monkey reconciliation, delisted-stock liquidation, and
-    kill_monkey() so every liquidation leaves the same Order audit trail.
+    Used when a monkey dies and during daily reconciliation for delisted/orphaned
+    stock: ownership of the holdings moves to the system monkey, which then sells
+    them off gradually via its own periodic task. Quantities merge into the system
+    monkey's existing (monkey, stock) holding (unique per pair).
+
+    Deliberate exception to "never mutate Holding outside submit_monkey_order" —
+    this is a bookkeeping move, not a trade, same as _clamp_phantom_holdings.
     """
-    kis_client = kis_client or KisClient()
-    holdings = Holding.objects.filter(monkey=monkey, quantity__gt=0)
-    if stock_ids is not None:
-        holdings = holdings.filter(stock_id__in=stock_ids)
+    if monkey.is_system:
+        return []
 
-    orders = []
-    for holding in list(holdings):
-        orders.append(
-            submit_monkey_order(
-                monkey_id=monkey.id,
-                stock_id=holding.stock_id,
-                order_type=Order.OrderTypeChoices.SELL,
-                quantity=holding.quantity,
-                kis_client=kis_client,
-            )
+    system_monkey = get_or_create_system_monkey()
+    transferred = []
+    with transaction.atomic():
+        holdings = Holding.objects.select_for_update().filter(
+            monkey=monkey, quantity__gt=0
         )
-    return orders
+        if stock_ids is not None:
+            holdings = holdings.filter(stock_id__in=stock_ids)
+        for holding in list(holdings):
+            dest, _ = Holding.objects.select_for_update().get_or_create(
+                monkey=system_monkey,
+                stock_id=holding.stock_id,
+                defaults={"quantity": 0},
+            )
+            dest.quantity += holding.quantity
+            dest.save(update_fields=["quantity"])
+            transferred.append(
+                {"stock_id": holding.stock_id, "quantity": holding.quantity}
+            )
+            holding.delete()
+    return transferred
 
 
-def _absorb_excess(ticker, excess_qty, kis_client):
-    """A ticker is held in the real KIS account but not owned by any monkey locally."""
+def _absorb_excess(ticker, excess_qty):
+    """A ticker is held in the real KIS account but not owned by any monkey locally.
+
+    Assign the excess to the hidden system monkey; its periodic task sells it off
+    later, so nothing is liquidated here.
+    """
     stock = Stock.objects.filter(ticker=ticker).order_by(
         "id"
     ).first() or _placeholder_stock(ticker)
@@ -884,13 +933,9 @@ def _absorb_excess(ticker, excess_qty, kis_client):
     holding.quantity += excess_qty
     holding.save(update_fields=["quantity"])
 
-    orders = liquidate_holdings_for_monkey(
-        system_monkey, stock_ids=[stock.id], kis_client=kis_client
-    )
     return {
         "ticker": ticker,
         "quantity": excess_qty,
-        "order_ids": [order.id for order in orders],
     }
 
 
@@ -942,7 +987,7 @@ def reconcile_holdings(kis_client=None):
         real_qty = real.get(ticker, 0)
         local_qty = local.get(ticker, 0)
         if real_qty > local_qty:
-            absorbed.append(_absorb_excess(ticker, real_qty - local_qty, kis_client))
+            absorbed.append(_absorb_excess(ticker, real_qty - local_qty))
         elif local_qty > real_qty:
             clamped.append(_clamp_phantom_holdings(ticker, local_qty - real_qty))
 
@@ -950,14 +995,13 @@ def reconcile_holdings(kis_client=None):
 
 
 def liquidate_orphaned_holdings():
-    """Daily reconciliation: absorb/clamp real-vs-local mismatches, sell off
-    holdings of delisted stocks, and finish liquidating killed (inactive)
-    monkeys whose holdings could not be sold while the market was closed.
-    Gated on the global kill switch, same as run_active_monkeys() — so a
-    force-kill requested after hours is carried out once the market re-opens."""
-    if not get_global_control().enabled:
-        return {"enabled": False}
+    """Reconcile real-vs-local holdings and hand off orphaned/delisted/dead-monkey
+    holdings to the system monkey for gradual liquidation.
 
+    DB-only moves plus a single KIS *read* (account balance) — no sell orders are
+    placed here, so this can run anytime, market open or closed. The system
+    monkey's own periodic task does the actual selling during market hours.
+    """
     kis_client = KisClient()
     reconciliation = reconcile_holdings(kis_client=kis_client)
 
@@ -965,25 +1009,24 @@ def liquidate_orphaned_holdings():
     for holding in Holding.objects.filter(
         quantity__gt=0, stock__is_active=False
     ).select_related("monkey", "stock"):
+        if holding.monkey.is_system:
+            continue  # already on the system monkey; it will try to sell it off
         by_monkey.setdefault(holding.monkey, []).append(holding.stock_id)
 
-    delisted_orders = 0
+    delisted_transfers = 0
     for monkey, stock_ids in by_monkey.items():
-        orders = liquidate_holdings_for_monkey(
-            monkey, stock_ids=stock_ids, kis_client=kis_client
-        )
-        delisted_orders += len(orders)
+        transferred = transfer_holdings_to_system_monkey(monkey, stock_ids=stock_ids)
+        delisted_transfers += len(transferred)
 
-    # Sweep killed monkeys that still hold stock (e.g. force-killed while the
-    # market was closed, so their sell orders had not gone through yet).
-    killed_orders = 0
+    # Sweep killed monkeys that still hold stock (safety net; kill_monkey already
+    # transfers, but reconciliation may have re-attributed leaked positions).
+    killed_transfers = 0
     for monkey in Monkey.objects.filter(state=Monkey.State.DEAD, is_system=False):
-        orders = liquidate_holdings_for_monkey(monkey, kis_client=kis_client)
-        killed_orders += len(orders)
+        transferred = transfer_holdings_to_system_monkey(monkey)
+        killed_transfers += len(transferred)
 
     return {
-        "enabled": True,
         "reconciliation": reconciliation,
-        "delisted_orders": delisted_orders,
-        "killed_orders": killed_orders,
+        "delisted_transfers": delisted_transfers,
+        "killed_transfers": killed_transfers,
     }

@@ -32,6 +32,16 @@ def run_monkey(monkey_id):
 
 
 @shared_task
+def run_system_monkey():
+    if not services.get_global_control().enabled:
+        return {"enabled": False}
+    order = services.run_system_monkey_order()
+    if order is None:
+        return {"enabled": True, "order_id": None}
+    return {"enabled": True, "order_id": order.id, "status": order.status}
+
+
+@shared_task
 def check_holiday():
     is_holiday = KisClient().is_holiday()
     note = "휴장일 (자동)" if is_holiday else "영업일 (자동)"
