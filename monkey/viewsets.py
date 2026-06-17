@@ -17,12 +17,17 @@ class IsAdminOrReadOnly(permissions.BasePermission):
 
 
 class MonkeyViewSet(viewsets.ModelViewSet):
-    queryset = Monkey.objects.filter(is_system=False).order_by("id")
+    queryset = Monkey.objects.all().order_by("id")
     serializer_class = serializers.MonkeySerializer
     permission_classes = [IsAdminOrReadOnly]
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # The system monkey (orphan-liquidation account) is shown only to staff on
+        # the admin manage table; guests and the public dashboard never see it.
+        user = self.request.user
+        if not (user and user.is_staff):
+            qs = qs.filter(is_system=False)
         # Read paths serialize per-monkey metrics/holdings; prefetch holdings and
         # succeeded orders once so the helpers run no per-monkey/per-stock queries.
         # Excluded for mutating actions (e.g. force-kill) so the response reflects
@@ -78,7 +83,9 @@ class MonkeyViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
-        monkeys = self.get_queryset()
+        # Aggregate trader metrics — the system monkey's FIFO metrics are
+        # meaningless, so exclude it here even when an admin is authenticated.
+        monkeys = self.get_queryset().filter(is_system=False)
         data = [
             {
                 "id": monkey.id,

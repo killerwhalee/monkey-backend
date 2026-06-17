@@ -20,6 +20,7 @@ class MonkeySerializer(serializers.ModelSerializer):
             "name",
             "state",
             "is_active",
+            "is_system",
             "balance",
             "initial_balance",
             "order_interval_seconds",

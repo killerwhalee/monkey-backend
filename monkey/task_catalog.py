@@ -13,13 +13,19 @@ the run button when the current state conflicts:
   "market_open"   — task only makes sense while the market is open
   "market_closed" — task only makes sense while the market is closed
   None            — no market-state restriction
+
+``manual`` controls whether the task appears in the manual-run UI at all. Set to
+``False`` for tasks that are fully automated (e.g. market open/close, index ticks)
+and should never be triggered by hand. These tasks are still included in the full
+catalog so their labels/descriptions populate the schedule and interval tables.
 """
 
 from market import tasks as market_tasks
 from monkey import tasks as monkey_tasks
 
-# (name, task, label, description, warnings, when) — order is the order shown in the UI.
-# An empty warnings list means the task is safe (read/refresh only).
+# (name, task, label, description, warnings, when, manual)
+# manual=False → label/description still appear in schedule/interval tables,
+#                but the task is hidden from the manual-run UI entirely.
 RUNNABLE_TASKS = [
     (
         "update_token",
@@ -28,6 +34,7 @@ RUNNABLE_TASKS = [
         "KIS 접근 토큰을 재발급합니다.",
         [],
         None,
+        True,
     ),
     (
         "check_holiday",
@@ -36,6 +43,7 @@ RUNNABLE_TASKS = [
         "오늘이 개장일인지 KIS 휴장일 API로 확인하고 게이트를 갱신합니다.",
         [],
         None,
+        True,
     ),
     (
         "update_market",
@@ -44,6 +52,7 @@ RUNNABLE_TASKS = [
         "KRX 코스피·코스닥 종목 목록을 내려받아 갱신합니다.",
         [],
         None,
+        True,
     ),
     (
         "record_index_tick",
@@ -52,6 +61,7 @@ RUNNABLE_TASKS = [
         "현재 원숭이 지수 값을 시계열 틱으로 기록합니다. 장중에만 유효합니다.",
         [],
         "market_open",
+        False,  # automated every N seconds; no value in manual runs
     ),
     (
         "update_held_stock_prices",
@@ -60,6 +70,7 @@ RUNNABLE_TASKS = [
         "원숭이들이 보유한 종목의 현재가를 KIS에서 새로 받아옵니다. 장중에만 유효합니다.",
         [],
         "market_open",
+        True,
     ),
     (
         "run_system_monkey",
@@ -68,6 +79,7 @@ RUNNABLE_TASKS = [
         "시스템 원숭이가 보유한 종목 중 하나를 무작위로 골라 전량 매도합니다. 장중에만 실행됩니다.",
         [],
         "market_open",
+        True,
     ),
     (
         "auto_create_monkeys",
@@ -76,6 +88,7 @@ RUNNABLE_TASKS = [
         "남은 예수금으로 가능한 만큼 새 원숭이를 생성합니다. 장 마감 중에만 실행됩니다.",
         [],
         "market_closed",
+        True,
     ),
     (
         "reconcile_executions",
@@ -84,6 +97,7 @@ RUNNABLE_TASKS = [
         "KIS 일별 체결 내역으로 주문의 실제 체결 수량·가격을 보정합니다. 장 마감 후에만 실행됩니다.",
         [],
         "market_closed",
+        True,
     ),
     (
         "snapshot_monkeys",
@@ -92,6 +106,7 @@ RUNNABLE_TASKS = [
         "원숭이별 자산·수익률 일일 스냅샷을 저장합니다. 장 마감 후에만 실행됩니다.",
         [],
         "market_closed",
+        True,
     ),
     (
         "market_open",
@@ -103,6 +118,7 @@ RUNNABLE_TASKS = [
             "활성 원숭이들의 주기 작업이 활성화됩니다.",
         ],
         None,
+        False,  # automated by beat schedule; manually running out of sequence breaks state
     ),
     (
         "market_close",
@@ -114,6 +130,7 @@ RUNNABLE_TASKS = [
             "원숭이들의 주기 작업이 비활성화됩니다.",
         ],
         None,
+        False,  # automated by beat schedule; manually running out of sequence breaks state
     ),
     (
         "daily_maintenance",
@@ -125,29 +142,35 @@ RUNNABLE_TASKS = [
             "장이 열려 있는 동안에는 실행되지 않고 건너뜁니다.",
         ],
         "market_closed",
+        True,
     ),
 ]
 
-# name -> task, for resolving a run-task request.
+# name -> task, for resolving a run-task request (manual-only tasks).
 TASK_MAP = {
-    name: task for name, task, _label, _description, _warnings, _when in RUNNABLE_TASKS
+    name: task
+    for name, task, _label, _description, _warnings, _when, manual in RUNNABLE_TASKS
+    if manual
 }
 
 # Celery task path (e.g. "monkey.tasks.market_open") -> Korean label, so the
 # schedule table can label a PeriodicTask by its registered task name.
+# Includes ALL tasks (manual or not) so automated tasks still get Korean labels.
 LABEL_BY_TASK_PATH = {
     task.name: label
-    for _name, task, label, _description, _warnings, _when in RUNNABLE_TASKS
+    for _name, task, label, _description, _warnings, _when, _manual in RUNNABLE_TASKS
 }
 
 # Celery task path -> Korean description, so the schedule/interval tables can
 # reuse the same one-line description shown on the run-task card.
+# Includes ALL tasks.
 DESCRIPTION_BY_TASK_PATH = {
     task.name: description
-    for _name, task, _label, description, _warnings, _when in RUNNABLE_TASKS
+    for _name, task, _label, description, _warnings, _when, _manual in RUNNABLE_TASKS
 }
 
 # Serializable catalog the API hands to the frontend (no task objects).
+# Only manual=True tasks — automated tasks have no run button.
 TASK_CATALOG = [
     {
         "name": name,
@@ -158,5 +181,6 @@ TASK_CATALOG = [
         "warnings": warnings,
         "when": when,
     }
-    for name, task, label, description, warnings, when in RUNNABLE_TASKS
+    for name, task, label, description, warnings, when, manual in RUNNABLE_TASKS
+    if manual
 ]

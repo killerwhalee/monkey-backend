@@ -138,6 +138,37 @@ class KisAccessToken(models.Model):
         )
 
 
+class KisAccountCache(models.Model):
+    """Cached KIS account balance, keyed by environment (like KisAccessToken).
+
+    A live KIS balance inquiry is throttled to ~1 req/sec, so the admin
+    "내 자산 현황" card would stall fetching it on every request. Instead the
+    market-hours poll (``services.update_held_stock_prices``) refreshes this row
+    and ``build_account_summary`` serves it without touching KIS.
+    """
+
+    environment = models.CharField(
+        "Environment",
+        max_length=32,
+        unique=True,
+    )
+    cash_balance = models.IntegerField("Cash balance")
+    securities_value = models.IntegerField("Securities value")
+    total_assets = models.IntegerField("Total assets")
+    total_pl = models.IntegerField("Total P&L")
+    earning_rate = models.FloatField("Earning rate")
+    updated_at = models.DateTimeField(
+        "Updated at",
+        auto_now=True,
+    )
+
+    def __str__(self):
+        return (
+            f"[{self.__class__.__name__} #{self.pk:04d}] "
+            f"{self.environment} total_assets={self.total_assets}"
+        )
+
+
 class Monkey(models.Model):
     class State(models.TextChoices):
         ACTIVE = "active", "Active"  # alive and trading
