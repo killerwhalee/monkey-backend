@@ -259,6 +259,13 @@ class AccountSummaryView(views.APIView):
         return Response(serializers.AccountSummarySerializer(data).data)
 
 
+class IndexReturnsView(views.APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return Response(services.build_index_returns())
+
+
 class CandlestickView(views.APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -270,5 +277,10 @@ class CandlestickView(views.APIView):
             limit = min(int(request.query_params.get("limit", 120)), 1000)
         except (TypeError, ValueError):
             limit = 120
-        data = services.build_index_candlesticks(unit=unit, limit=limit)
+        try:
+            before = request.query_params.get("before")
+            before = int(before) if before is not None else None
+        except (TypeError, ValueError):
+            before = None
+        data = services.build_index_candlesticks(unit=unit, limit=limit, before=before)
         return Response(serializers.CandlestickSerializer(data, many=True).data)

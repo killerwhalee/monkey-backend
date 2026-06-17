@@ -30,4 +30,9 @@ urlpatterns = router.urls + [
         viewsets.CandlestickView.as_view(),
         name="candlesticks",
     ),
+    path(
+        "index-returns/",
+        viewsets.IndexReturnsView.as_view(),
+        name="index-returns",
+    ),
 ]

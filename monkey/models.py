@@ -38,11 +38,6 @@ class GlobalMonkeyControl(models.Model):
         max_length=256,
         blank=True,
     )
-    kill_threshold = models.FloatField(
-        "Kill threshold (earning ratio)",
-        default=-0.5,
-        help_text="Monkeys whose earning_ratio drops below this value are automatically deactivated.",
-    )
     auto_create_starting_balance = models.PositiveIntegerField(
         "Auto-create starting balance",
         default=1_000_000,
@@ -50,16 +45,16 @@ class GlobalMonkeyControl(models.Model):
         help_text="Cash each monkey is created with (auto-create divides unallocated cash by this).",
     )
     auto_create_min_interval_seconds = models.PositiveIntegerField(
-        "New monkey min order interval (seconds)",
+        "Min order interval (seconds)",
         default=60,
         validators=[MinValueValidator(60), MaxValueValidator(7200)],
-        help_text="Lower bound of the random order interval assigned to newly created monkeys.",
+        help_text="Fastest possible cadence (haste=1). The haste trait interpolates the order interval across this min..max range.",
     )
     auto_create_max_interval_seconds = models.PositiveIntegerField(
-        "New monkey max order interval (seconds)",
+        "Max order interval (seconds)",
         default=1800,
         validators=[MinValueValidator(60), MaxValueValidator(7200)],
-        help_text="Upper bound of the random order interval assigned to newly created monkeys.",
+        help_text="Slowest possible cadence (haste=0). The haste trait interpolates the order interval across this min..max range.",
     )
     created_at = models.DateTimeField(
         "Created at",
@@ -199,7 +194,19 @@ class Monkey(models.Model):
         "Order interval (seconds)",
         default=60,
         validators=[MinValueValidator(60), MaxValueValidator(7200)],
-        help_text="How often this monkey places a random order.",
+        help_text="How often this monkey places a random order. Derived from `haste` at birth.",
+    )
+    haste = models.FloatField(
+        "성급함 (haste)",
+        default=0.5,
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text="Trading frequency trait (0..1). Higher = more frequent (shorter interval).",
+    )
+    balls = models.FloatField(
+        "배짱 (balls)",
+        default=0.5,
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text="Boldness trait (0..1). Higher = larger orders (bigger fraction of affordable/held).",
     )
     is_system = models.BooleanField(
         "Is system monkey?",
@@ -391,7 +398,7 @@ class MonkeyIndexBaseline(models.Model):
 
 
 class MonkeyIndexTick(models.Model):
-    """Per-minute sample of the Monkey Index value (base 10,000).
+    """Per-minute sample of the Monkey Index value (base 1,000).
 
     Used to build the candlestick chart (open/high/low/close per bucket).
     """

@@ -143,14 +143,18 @@ class Command(BaseCommand):
         return stocks
 
     def _seed_monkeys(self, rng, stocks, count):
+        control = services.get_global_control()
         monkeys = []
         for _ in range(count):
             active = rng.random() > 0.15
+            haste = services.random_trait(rng)
             monkey = Monkey(
                 name=generate_monkey_name(),
                 balance=INITIAL_BALANCE,
                 initial_balance=INITIAL_BALANCE,
-                order_interval_seconds=rng.randint(60, 1800),
+                haste=haste,
+                balls=services.random_trait(rng),
+                order_interval_seconds=services.derive_interval(haste, control),
                 state=Monkey.State.ACTIVE if active else Monkey.State.DEAD,
             )
             if not active:

@@ -10,6 +10,8 @@ class MonkeyAdmin(admin.ModelAdmin):
         "state",
         "balance",
         "initial_balance",
+        "haste",
+        "balls",
         "order_interval_seconds",
         "killed_at",
         "created_at",
@@ -30,7 +32,6 @@ class GlobalMonkeyControlAdmin(admin.ModelAdmin):
     list_display = [
         "id",
         "enabled",
-        "kill_threshold",
         "note",
         "updated_at",
     ]

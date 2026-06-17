@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 import time
 from datetime import timedelta
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Cold-start value for the Monkey Index, used only when no index has ever been
 # recorded; afterwards each day chains off the previous day's closing value.
-MONKEY_INDEX_BASE = 10000.0
+MONKEY_INDEX_BASE = 1000.0
 
 
 class InsufficientCashError(Exception):
@@ -298,20 +299,40 @@ def kill_monkey(monkey: Monkey) -> Monkey:
     return monkey
 
 
-def kill_underperforming_monkeys() -> int:
-    """Kill every alive monkey whose earning_ratio is below the kill threshold.
+# A monkey that places no successful order across this many consecutive trading
+# days is presumed too broke to trade and is culled.
+INACTIVITY_KILL_DAYS = 3
 
-    Run as a daily off-market task (see run_daily_maintenance) rather than per
-    trade, so the alive set stays fixed during a trading session and the Monkey
-    Index baseline/live equity remain comparable. Returns the number killed.
+
+def kill_inactive_monkeys() -> int:
+    """Kill every alive monkey that placed no successful order across the last
+    ``INACTIVITY_KILL_DAYS`` trading days — i.e. its balance is too low to keep
+    trading.
+
+    Trading days come from ``MonkeyIndexBaseline`` (one row per market-open day).
+    Monkeys younger than that window are spared (grace period). Run as a daily
+    off-market task (see run_daily_maintenance) rather than per trade, so the
+    alive set stays fixed during a session and the Monkey Index baseline/live
+    equity remain comparable. Returns the number killed.
     """
-    # Deferred import: serializers.py does `from monkey import services`.
-    from monkey.serializers import build_monkey_metrics
+    recent_days = list(
+        MonkeyIndexBaseline.objects.filter(date__lte=timezone.localdate())
+        .order_by("-date")
+        .values_list("date", flat=True)[:INACTIVITY_KILL_DAYS]
+    )
+    if len(recent_days) < INACTIVITY_KILL_DAYS:
+        return 0  # not enough trading history yet to judge inactivity
 
-    threshold = get_global_control().kill_threshold
+    earliest = min(recent_days)
     killed = 0
-    for monkey in _alive_monkeys():
-        if build_monkey_metrics(monkey)["earning_ratio"] < threshold:
+    # Only monkeys that existed for the whole window are eligible (grace period).
+    for monkey in _alive_monkeys().filter(created_at__date__lte=earliest):
+        had_order = Order.objects.filter(
+            monkey=monkey,
+            status=Order.StatusChoices.SUCCEEDED,
+            created_at__date__in=recent_days,
+        ).exists()
+        if not had_order:
             kill_monkey(monkey)
             killed += 1
     return killed
@@ -340,14 +361,6 @@ def snapshot_all_monkeys(target_date=None):
 def build_dashboard_summary():
     monkeys = list(Monkey.objects.filter(is_system=False))
     active_monkeys = [monkey for monkey in monkeys if monkey.is_active]
-    average_interval = (
-        round(
-            sum(monkey.order_interval_seconds for monkey in active_monkeys)
-            / len(active_monkeys)
-        )
-        if active_monkeys
-        else 0
-    )
 
     monkey_index = current_index_value()
     baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
@@ -359,7 +372,6 @@ def build_dashboard_summary():
         "monkey_index": monkey_index,
         "monkey_index_open": base_index,
         "monkey_index_change": monkey_index_change,
-        "average_order_interval_seconds": average_interval,
         "latest_orders": (
             Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
             .select_related("monkey", "stock")
@@ -450,6 +462,59 @@ def current_index_value():
     return last_baseline.base_index if last_baseline else MONKEY_INDEX_BASE
 
 
+# Lookbacks (in days) for the index earning-rate breakdown.
+INDEX_RETURN_PERIODS = {
+    "day": 1,
+    "week": 7,
+    "month": 30,
+    "quarter": 90,
+}
+
+
+def _index_close_on_or_before(target_date):
+    """``(date, value)`` of the index close on or before ``target_date`` — the
+    last tick of the most recent trading day, falling back to the carried-forward
+    baseline. ``None`` when no index data reaches that far back."""
+    tick = (
+        MonkeyIndexTick.objects.filter(recorded_at__date__lte=target_date)
+        .order_by("recorded_at")
+        .last()
+    )
+    if tick is not None:
+        return timezone.localtime(tick.recorded_at).date(), tick.value
+    baseline = (
+        MonkeyIndexBaseline.objects.filter(date__lte=target_date)
+        .order_by("date")
+        .last()
+    )
+    if baseline is not None:
+        return baseline.date, baseline.base_index
+    return None
+
+
+def build_index_returns():
+    """Monkey Index earning rate against several lookbacks (day/week/month/quarter).
+
+    Returns the current index plus, per period, the reference date, that day's
+    index value, and the rate ``current / reference - 1``. A period with no data
+    that far back yields ``None``."""
+    today = timezone.localdate()
+    current = current_index_value()
+    periods = {}
+    for key, days in INDEX_RETURN_PERIODS.items():
+        reference = _index_close_on_or_before(today - timedelta(days=days))
+        if reference is None:
+            periods[key] = None
+            continue
+        ref_date, ref_value = reference
+        periods[key] = {
+            "date": ref_date.isoformat(),
+            "index": ref_value,
+            "rate": (current / ref_value - 1) if ref_value else None,
+        }
+    return {"current": current, "periods": periods}
+
+
 CANDLE_UNIT_SECONDS = {
     "1m": 60,
     "15m": 900,
@@ -464,13 +529,18 @@ CANDLE_UNIT_SECONDS = {
 KST_OFFSET_SECONDS = 9 * 3600
 
 
-def build_index_candlesticks(unit="1d", limit=120):
+def build_index_candlesticks(unit="1d", limit=120, before=None):
     """Bucket per-minute Monkey Index ticks into OHLC candlesticks.
 
     ``unit`` is one of ``CANDLE_UNIT_SECONDS``. Each candle's ``time`` is the
     bucket-start as epoch seconds (what lightweight-charts expects). ``1d``
     buckets align to the local trading day; intraday units floor the absolute
     timestamp to the unit width.
+
+    ``before`` is an exclusive upper bound on the candle ``time`` (the same
+    KST-offset epoch the client holds): only candles strictly older than it are
+    returned. With ``limit`` this paginates backwards so the chart can lazily
+    load history as the user pans into the past.
     """
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
     buckets = {}
@@ -496,6 +566,8 @@ def build_index_candlesticks(unit="1d", limit=120):
         }
         for bucket, values in sorted(buckets.items())
     ]
+    if before is not None:
+        candlesticks = [candle for candle in candlesticks if candle["time"] < before]
     return candlesticks[-limit:]
 
 
@@ -650,19 +722,71 @@ def unallocated_cash(kis_client=None):
     return kis_cash - allocated
 
 
-def create_monkeys(count, starting_balance):
-    # Individual saves (not bulk_create) so Monkey.save() fires and creates PeriodicTasks.
-    # The random order-interval range is configurable via GlobalMonkeyControl.
-    control = get_global_control()
+# Traits are floats in [TRAIT_FLOOR, 1]; the floor keeps both > 0 so no monkey is
+# born degenerate (balls=0 would round every order to 0 shares).
+TRAIT_FLOOR = 0.05
+
+
+def clamp_trait(value):
+    return max(TRAIT_FLOOR, min(1.0, value))
+
+
+def random_trait(rng=None):
+    """A fresh trait value, used for genesis monkeys (no parents to mate)."""
+    rng = rng or random
+    return rng.uniform(TRAIT_FLOOR, 1.0)
+
+
+def mate_traits(parent_a, parent_b, rng=None):
+    """Breed (haste, balls) from two parents: each trait is drawn from a normal
+    distribution centred on the parents' average, with a gap-based spread so the
+    child has room to exceed either parent. Clamped to [TRAIT_FLOOR, 1]."""
+    rng = rng or random
+
+    def _breed(a, b):
+        sigma = max(abs(a - b) / 2, 0.1)
+        return clamp_trait(rng.gauss((a + b) / 2, sigma))
+
+    return _breed(parent_a.haste, parent_b.haste), _breed(
+        parent_a.balls, parent_b.balls
+    )
+
+
+def derive_interval(haste, control):
+    """Order interval interpolated across the configured min..max range by haste:
+    haste=1 → min (fastest), haste=0 → max (slowest)."""
     low = control.auto_create_min_interval_seconds
     high = control.auto_create_max_interval_seconds
+    return round(low + (high - low) * (1 - haste))
+
+
+def _spawn_traits(parent_pool, rng):
+    """Mate two random parents from the pool, or random traits if fewer than two."""
+    if len(parent_pool) >= 2:
+        parent_a, parent_b = rng.sample(parent_pool, 2)
+        return mate_traits(parent_a, parent_b, rng)
+    return random_trait(rng), random_trait(rng)
+
+
+def create_monkeys(count, starting_balance, rng=None):
+    """Create ``count`` monkeys, each bred from two random alive monkeys (or with
+    random traits when fewer than two exist). The order interval is derived from
+    the child's haste. Individual saves (not bulk_create) so Monkey.save() fires
+    and creates the per-monkey PeriodicTask."""
+    rng = rng or random
+    control = get_global_control()
+    # Snapshot the parent pool once so it's deterministic for a given rng seed.
+    parent_pool = list(_alive_monkeys())
     monkeys = []
     for _ in range(count):
+        haste, balls = _spawn_traits(parent_pool, rng)
         monkey = Monkey(
             name=generate_monkey_name(),
             balance=starting_balance,
             initial_balance=starting_balance,
-            order_interval_seconds=random.randint(low, high),
+            haste=haste,
+            balls=balls,
+            order_interval_seconds=derive_interval(haste, control),
         )
         monkey.save()
         monkeys.append(monkey)
@@ -715,11 +839,27 @@ def run_active_monkeys():
     }
 
 
+def _buy_quantity(monkey, stock, kis_client=None):
+    """Shares to buy = floor(max_affordable × balls), using the cached price
+    (falling back to a live fetch). Floored so the order never costs more than
+    the monkey's cash. Returns 0 when nothing is affordable or the price can't
+    be resolved — the caller then records a SKIPPED order."""
+    price = stock.current_price
+    if not price:
+        try:
+            price = (kis_client or KisClient()).get_stock_price(stock.ticker)
+        except (KisClientError, ValueError):
+            return 0
+    if not price:
+        return 0
+    max_buyable = monkey.balance // price
+    return math.floor(max_buyable * monkey.balls)
+
+
 def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
     rng = rng or random
     monkey = Monkey.objects.get(pk=monkey_id)
     order_type = rng.choice([Order.OrderTypeChoices.BUY, Order.OrderTypeChoices.SELL])
-    quantity = 1
 
     if order_type == Order.OrderTypeChoices.BUY:
         stock = Stock.objects.filter(is_active=True).order_by("?").first()
@@ -728,9 +868,20 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 monkey=monkey,
                 stock=_placeholder_stock(),
                 order_type=order_type,
-                requested_quantity=quantity,
+                requested_quantity=1,
                 status=Order.StatusChoices.SKIPPED,
                 failure_reason="No stock is available.",
+            )
+        # Boldness (balls) sets the slice of affordable shares to buy.
+        quantity = _buy_quantity(monkey, stock, kis_client)
+        if quantity < 1:
+            return Order.objects.create(
+                monkey=monkey,
+                stock=stock,
+                order_type=order_type,
+                requested_quantity=0,
+                status=Order.StatusChoices.SKIPPED,
+                failure_reason="Affordable amount rounds to zero shares.",
             )
     else:
         holding = (
@@ -747,11 +898,14 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 monkey=monkey,
                 stock=stock,
                 order_type=order_type,
-                requested_quantity=quantity,
+                requested_quantity=1,
                 status=Order.StatusChoices.SKIPPED,
                 failure_reason="Monkey has no holdings to sell.",
             )
         stock = holding.stock
+        # Boldness sets the slice of the holding to sell; ceil so a 1-share
+        # holding still sells (and we never exceed what's actually held).
+        quantity = min(math.ceil(holding.quantity * monkey.balls), holding.quantity)
 
     order = submit_monkey_order(
         monkey_id=monkey.id,
@@ -1057,24 +1211,79 @@ def _absorb_excess(ticker, excess_qty):
     }
 
 
+def _succeeded_order_net(monkey_id, stock_id):
+    """Net shares a monkey's succeeded orders imply for a stock (buys − sells of
+    executed quantity). This is what the Holding *should* be; a Holding above it
+    is a demonstrable phantom (e.g. a partial fill corrected on the Order but not
+    the Holding)."""
+    net = 0
+    rows = (
+        Order.objects.filter(
+            monkey_id=monkey_id,
+            stock_id=stock_id,
+            status=Order.StatusChoices.SUCCEEDED,
+        )
+        .values("order_type")
+        .annotate(total=Sum("executed_quantity"))
+    )
+    for row in rows:
+        qty = row["total"] or 0
+        if row["order_type"] == Order.OrderTypeChoices.BUY:
+            net += qty
+        else:
+            net -= qty
+    return net
+
+
 def _clamp_phantom_holdings(ticker, phantom_qty):
-    """Local Holding totals for a ticker exceed the real KIS account quantity.
+    """Reduce local Holdings for ``ticker`` by ``phantom_qty`` to match reality.
+
+    Attribution is order-history-aware: phantom shares are docked first from the
+    monkeys whose Holding exceeds their own succeeded-order net (the demonstrable
+    phantom), largest excess first. Any remainder — real-account drift with no
+    per-monkey signal — falls back to a deterministic largest-holding sweep so the
+    aggregate always reconciles.
 
     Deliberate exception to "never mutate Holding.quantity outside
     submit_monkey_order" — this is a reconciliation sweep, not a trade.
     """
+    holdings = list(
+        Holding.objects.filter(stock__short_code=ticker, quantity__gt=0).select_related(
+            "stock"
+        )
+    )
     remaining = phantom_qty
     affected = []
-    for holding in Holding.objects.filter(
-        stock__short_code=ticker, quantity__gt=0
-    ).order_by("-quantity"):
-        if remaining <= 0:
-            break
-        reduction = min(remaining, holding.quantity)
+
+    def _reduce(holding, reduction):
+        nonlocal remaining
         holding.quantity -= reduction
         _save_holding(holding)
         remaining -= reduction
         affected.append({"holding_id": holding.id, "reduced_by": reduction})
+
+    # Pass 1: demonstrable phantom — Holding above its own succeeded-order net.
+    excesses = []
+    for holding in holdings:
+        excess = holding.quantity - max(
+            0, _succeeded_order_net(holding.monkey_id, holding.stock_id)
+        )
+        if excess > 0:
+            excesses.append((excess, holding))
+    excesses.sort(key=lambda pair: pair[0], reverse=True)
+    for excess, holding in excesses:
+        if remaining <= 0:
+            break
+        _reduce(holding, min(remaining, excess))
+
+    # Pass 2: fallback for any remainder (real drift), largest holding first.
+    if remaining > 0:
+        for holding in sorted(holdings, key=lambda h: h.quantity, reverse=True):
+            if remaining <= 0:
+                break
+            if holding.quantity <= 0:
+                continue
+            _reduce(holding, min(remaining, holding.quantity))
 
     return {
         "ticker": ticker,
@@ -1116,7 +1325,7 @@ def reconcile_holdings(kis_client=None):
 
 
 def run_daily_maintenance():
-    """Daily off-market upkeep: cull underperforming monkeys, then reconcile
+    """Daily off-market upkeep: cull monkeys inactive for 3 trading days, then reconcile
     real-vs-local holdings and hand off orphaned/delisted/dead-monkey holdings to
     the system monkey for gradual liquidation.
 
@@ -1129,7 +1338,7 @@ def run_daily_maintenance():
     if get_global_control().market_open:
         return {"skipped": "market_open"}
 
-    killed = kill_underperforming_monkeys()
+    killed = kill_inactive_monkeys()
 
     kis_client = KisClient()
     reconciliation = reconcile_holdings(kis_client=kis_client)

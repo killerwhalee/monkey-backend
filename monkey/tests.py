@@ -17,6 +17,7 @@ from monkey.models import (
     KisAccountCache,
     Monkey,
     MonkeyDailySnapshot,
+    MonkeyIndexBaseline,
 )
 from monkey.serializers import build_monkey_metrics
 
@@ -254,11 +255,13 @@ class MonkeyServiceTests(TestCase):
         self.assertEqual(result["enabled"], False)
         self.assertEqual(Order.objects.count(), 0)
 
-    def test_random_order_quantity_is_always_one(self):
+    def test_random_buy_quantity_scales_with_balls(self):
+        # balance 5000 / price 100 = 50 affordable; balls 0.4 → floor(50*0.4) = 20.
         monkey = Monkey.objects.create(
             name="A",
             balance=5000,
             initial_balance=5000,
+            balls=0.4,
         )
 
         class Rng:
@@ -271,21 +274,45 @@ class MonkeyServiceTests(TestCase):
             rng=Rng(),
         )
 
-        self.assertEqual(order.requested_quantity, 1)
+        self.assertEqual(order.requested_quantity, 20)
         self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        monkey.refresh_from_db()
+        self.assertEqual(monkey.balance, 3000)
 
-    def test_random_sell_order_picks_holding_stock_and_sells_one_share(self):
+    def test_random_buy_skipped_when_amount_rounds_to_zero(self):
+        # Price exceeds balance → 0 affordable → SKIPPED, no balance change.
+        monkey = Monkey.objects.create(
+            name="A", balance=500, initial_balance=500, balls=0.9
+        )
+
+        class Rng:
+            def choice(self, values):
+                return Order.OrderTypeChoices.BUY
+
+        order = services.run_random_monkey_order(
+            monkey.id,
+            kis_client=FakeKisClient(price=1000),
+            rng=Rng(),
+        )
+
+        self.assertEqual(order.status, Order.StatusChoices.SKIPPED)
+        monkey.refresh_from_db()
+        self.assertEqual(monkey.balance, 500)
+
+    def test_random_sell_order_sells_balls_fraction_rounded_up(self):
+        # holding 21 * balls 0.4 = 8.4 → ceil = 9 sold, 12 remain.
         monkey = Monkey.objects.create(
             name="A",
             balance=5000,
             initial_balance=5000,
+            balls=0.4,
         )
         other_stock = Stock.objects.create(
             market="KOSPI",
             ticker="000660",
             name="SK Hynix",
         )
-        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=2)
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=21)
 
         class Rng:
             def choice(self, values):
@@ -299,10 +326,33 @@ class MonkeyServiceTests(TestCase):
 
         self.assertEqual(order.stock_id, self.stock.id)
         self.assertNotEqual(order.stock_id, other_stock.id)
-        self.assertEqual(order.requested_quantity, 1)
+        self.assertEqual(order.requested_quantity, 9)
         self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
         self.assertEqual(
-            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 1
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 12
+        )
+
+    def test_random_sell_of_single_share_holding_still_sells(self):
+        # ceil(1 * any balls in (0,1]) == 1, so a 1-share holding always sells.
+        monkey = Monkey.objects.create(
+            name="A", balance=0, initial_balance=5000, balls=0.05
+        )
+        Holding.objects.create(monkey=monkey, stock=self.stock, quantity=1)
+
+        class Rng:
+            def choice(self, values):
+                return Order.OrderTypeChoices.SELL
+
+        order = services.run_random_monkey_order(
+            monkey.id,
+            kis_client=FakeKisClient(price=100),
+            rng=Rng(),
+        )
+
+        self.assertEqual(order.requested_quantity, 1)
+        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertFalse(
+            Holding.objects.filter(monkey=monkey, stock=self.stock).exists()
         )
 
     def test_create_monkeys_assigns_pet_names_and_intervals(self):
@@ -316,6 +366,8 @@ class MonkeyServiceTests(TestCase):
         self.assertEqual(third.name, "Arthur III")
         for monkey in (first, second, third):
             self.assertTrue(60 <= monkey.order_interval_seconds <= 1800)
+            self.assertTrue(services.TRAIT_FLOOR <= monkey.haste <= 1.0)
+            self.assertTrue(services.TRAIT_FLOOR <= monkey.balls <= 1.0)
 
     def test_kill_monkey_transfers_holdings_to_system_monkey(self):
         services.set_trading_enabled(True)
@@ -442,6 +494,71 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(holding.quantity, 2)
         self.assertEqual(Order.objects.count(), 0)
 
+    def _succeeded(self, monkey, order_type, quantity):
+        Order.objects.create(
+            monkey=monkey,
+            stock=self.stock,
+            order_type=order_type,
+            status=Order.StatusChoices.SUCCEEDED,
+            requested_quantity=quantity,
+            executed_quantity=quantity,
+            estimated_price=100,
+            executed_price=100,
+        )
+
+    def test_clamp_attributes_phantom_to_inconsistent_monkey(self):
+        # monkey1: holds 5, order history nets 5 (consistent).
+        monkey1 = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey1, stock=self.stock, quantity=5)
+        self._succeeded(monkey1, Order.OrderTypeChoices.BUY, 5)
+        # monkey2: holds 3, but orders net only 1 (partial-fill divergence of 2).
+        monkey2 = Monkey.objects.create(name="B", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey2, stock=self.stock, quantity=3)
+        self._succeeded(monkey2, Order.OrderTypeChoices.BUY, 1)
+
+        # Real account = 6; local aggregate = 8 → phantom 2, all from monkey2.
+        fake_client = FakeKisClient(price=100, holdings={"005930": 6})
+        result = services.reconcile_holdings(kis_client=fake_client)
+
+        self.assertEqual(result["absorbed"], [])
+        self.assertEqual(len(result["clamped"]), 1)
+        # Largest-first would have wrongly docked monkey1; attribution spares it.
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey1, stock=self.stock).quantity, 5
+        )
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey2, stock=self.stock).quantity, 1
+        )
+
+    def test_clamp_falls_back_to_largest_when_no_divergence(self):
+        # Both monkeys' holdings match their order history (no per-monkey signal).
+        monkey1 = Monkey.objects.create(name="A", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey1, stock=self.stock, quantity=5)
+        self._succeeded(monkey1, Order.OrderTypeChoices.BUY, 5)
+        monkey2 = Monkey.objects.create(name="B", balance=0, initial_balance=0)
+        Holding.objects.create(monkey=monkey2, stock=self.stock, quantity=2)
+        self._succeeded(monkey2, Order.OrderTypeChoices.BUY, 2)
+
+        # Real = 6; local = 7 → phantom 1 from real drift → fallback docks largest.
+        fake_client = FakeKisClient(price=100, holdings={"005930": 6})
+        result = services.reconcile_holdings(kis_client=fake_client)
+
+        self.assertEqual(result["absorbed"], [])
+        self.assertEqual(len(result["clamped"]), 1)
+        total = sum(
+            Holding.objects.filter(stock=self.stock, quantity__gt=0).values_list(
+                "quantity", flat=True
+            )
+        )
+        self.assertEqual(total, 6)
+        # Largest holder (monkey1) absorbs the unattributable drift.
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey1, stock=self.stock).quantity, 4
+        )
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey2, stock=self.stock).quantity, 2
+        )
+
     def test_reconcile_matches_prefixed_ticker_by_short_code(self):
         # KIS strips the leading prefix char from tickers longer than 6 chars, so
         # ETN "Q610039" reports as "610039" and warrant "J0669721F" as "0669721F".
@@ -530,11 +647,32 @@ class OrphanedHoldingsTests(TestCase):
         loser.refresh_from_db()
         self.assertEqual(loser.state, Monkey.State.ACTIVE)
 
-    def test_daily_maintenance_culls_underperforming_monkeys(self):
-        # earning_ratio = (balance - initial) / initial = (100 - 1000)/1000 = -0.9,
-        # below the default kill threshold (-0.5), so the monkey is culled.
-        loser = Monkey.objects.create(name="L", balance=100, initial_balance=1000)
+    def test_daily_maintenance_culls_monkeys_inactive_for_three_trading_days(self):
+        today = timezone.localdate()
+        # Three trading days (today, -1, -2) registered via the index baseline.
+        recent_days = [today - timedelta(days=offset) for offset in range(3)]
+        for day in recent_days:
+            MonkeyIndexBaseline.objects.create(
+                date=day, base_index=10000.0, base_equity=1000
+            )
+
+        # All three monkeys predate the window (no grace exemption).
+        loser = Monkey.objects.create(name="L", balance=0, initial_balance=1000)
         winner = Monkey.objects.create(name="W", balance=1000, initial_balance=1000)
+        Monkey.objects.filter(pk__in=[loser.pk, winner.pk]).update(
+            created_at=timezone.now() - timedelta(days=5)
+        )
+        # The winner traded successfully within the window; the loser did not.
+        Order.objects.create(
+            monkey=winner,
+            stock=self.stock,
+            order_type=Order.OrderTypeChoices.BUY,
+            requested_quantity=1,
+            status=Order.StatusChoices.SUCCEEDED,
+        )
+
+        # A fresh monkey (created today) is spared by the grace period.
+        newbie = Monkey.objects.create(name="N", balance=0, initial_balance=1000)
 
         with mock.patch("monkey.services.KisClient", return_value=FakeKisClient()):
             result = services.run_daily_maintenance()
@@ -542,8 +680,24 @@ class OrphanedHoldingsTests(TestCase):
         self.assertEqual(result["killed"], 1)
         loser.refresh_from_db()
         winner.refresh_from_db()
+        newbie.refresh_from_db()
         self.assertEqual(loser.state, Monkey.State.DEAD)
         self.assertEqual(winner.state, Monkey.State.ACTIVE)
+        self.assertEqual(newbie.state, Monkey.State.ACTIVE)
+
+    def test_kill_inactive_noop_without_enough_trading_history(self):
+        # Fewer than INACTIVITY_KILL_DAYS baselines → no culling.
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=1000
+        )
+        loser = Monkey.objects.create(name="L", balance=0, initial_balance=1000)
+        Monkey.objects.filter(pk=loser.pk).update(
+            created_at=timezone.now() - timedelta(days=5)
+        )
+
+        self.assertEqual(services.kill_inactive_monkeys(), 0)
+        loser.refresh_from_db()
+        self.assertEqual(loser.state, Monkey.State.ACTIVE)
 
     def test_run_system_monkey_order_sells_full_quantity_and_keeps_zero_balance(self):
         system_monkey = services.get_or_create_system_monkey()
@@ -723,7 +877,6 @@ class MonkeyApiTests(APITestCase):
             reverse("global-monkey-control-current"),
             {
                 "auto_create_starting_balance": 250_000,
-                "kill_threshold": -0.8,
                 "auto_create_min_interval_seconds": 120,
                 "auto_create_max_interval_seconds": 600,
             },
@@ -732,7 +885,6 @@ class MonkeyApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         control = services.get_global_control()
         self.assertEqual(control.auto_create_starting_balance, 250_000)
-        self.assertEqual(control.kill_threshold, -0.8)
         self.assertEqual(control.auto_create_min_interval_seconds, 120)
         self.assertEqual(control.auto_create_max_interval_seconds, 600)
 
@@ -1403,6 +1555,88 @@ class CandlestickApiTests(APITestCase):
         expected = shifted - (shifted % 60)
         self.assertEqual(candles[-1]["time"], expected)
 
+    def _seed_minute_ticks(self, count):
+        from monkey.models import MonkeyIndexTick
+
+        base = timezone.now().replace(second=0, microsecond=0)
+        for offset in range(count):
+            tick = MonkeyIndexTick.objects.create(value=10000.0 + offset)
+            MonkeyIndexTick.objects.filter(pk=tick.pk).update(
+                recorded_at=base - timedelta(minutes=count - 1 - offset)
+            )
+
+    def test_candlesticks_before_returns_only_older(self):
+        self._seed_minute_ticks(5)
+        all_candles = services.build_index_candlesticks(unit="1m")
+        self.assertEqual(len(all_candles), 5)
+        cutoff = all_candles[3]["time"]
+
+        response = self.client.get(
+            reverse("candlesticks"), {"unit": "1m", "before": cutoff}
+        )
+        self.assertEqual(response.status_code, 200)
+        times = [candle["time"] for candle in response.data]
+        self.assertTrue(all(time < cutoff for time in times))
+        self.assertEqual(times, [candle["time"] for candle in all_candles[:3]])
+
+    def test_candlesticks_before_respects_limit(self):
+        self._seed_minute_ticks(5)
+        all_candles = services.build_index_candlesticks(unit="1m")
+        cutoff = all_candles[4]["time"]
+
+        # before excludes the newest candle; limit returns the 2 just older.
+        page = services.build_index_candlesticks(unit="1m", limit=2, before=cutoff)
+        self.assertEqual(
+            [candle["time"] for candle in page],
+            [candle["time"] for candle in all_candles[2:4]],
+        )
+
+
+class IndexReturnsApiTests(APITestCase):
+    def _tick(self, value, days_ago):
+        from monkey.models import MonkeyIndexTick
+
+        tick = MonkeyIndexTick.objects.create(value=value)
+        MonkeyIndexTick.objects.filter(pk=tick.pk).update(
+            recorded_at=timezone.now() - timedelta(days=days_ago)
+        )
+        return tick
+
+    def test_index_returns_computes_available_periods(self):
+        self._tick(800.0, 8)  # week reference (close on/before 7 days ago)
+        self._tick(1000.0, 1)  # day reference (yesterday's close)
+        self._tick(1100.0, 0)  # current
+
+        returns = services.build_index_returns()
+        today = timezone.localdate()
+        periods = returns["periods"]
+
+        self.assertAlmostEqual(returns["current"], 1100.0)
+
+        self.assertEqual(
+            periods["day"]["date"], (today - timedelta(days=1)).isoformat()
+        )
+        self.assertAlmostEqual(periods["day"]["index"], 1000.0)
+        self.assertAlmostEqual(periods["day"]["rate"], 0.1)
+
+        self.assertEqual(
+            periods["week"]["date"], (today - timedelta(days=8)).isoformat()
+        )
+        self.assertAlmostEqual(periods["week"]["index"], 800.0)
+        self.assertAlmostEqual(periods["week"]["rate"], 1100 / 800 - 1)
+
+        # No data a month/quarter back yet.
+        self.assertIsNone(periods["month"])
+        self.assertIsNone(periods["quarter"])
+
+    def test_index_returns_endpoint_is_public_with_all_periods(self):
+        response = self.client.get(reverse("index-returns"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data.keys()), {"current", "periods"})
+        self.assertEqual(
+            set(response.data["periods"].keys()), {"day", "week", "month", "quarter"}
+        )
+
 
 class MonkeyIndexTests(TestCase):
     def test_baseline_cold_starts_at_base_value(self):
@@ -1752,3 +1986,69 @@ class SystemMonkeyVisibilityTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         ids = {row["id"] for row in response.data}
         self.assertNotIn(self.system.id, ids)
+
+
+class TraitTests(TestCase):
+    def test_derive_interval_interpolates_across_min_max(self):
+        control = services.get_global_control()
+        control.auto_create_min_interval_seconds = 100
+        control.auto_create_max_interval_seconds = 1100
+        control.save(
+            update_fields=[
+                "auto_create_min_interval_seconds",
+                "auto_create_max_interval_seconds",
+            ]
+        )
+        # haste=1 → fastest (min); haste=0 → slowest (max); 0.5 → midpoint.
+        self.assertEqual(services.derive_interval(1.0, control), 100)
+        self.assertEqual(services.derive_interval(0.0, control), 1100)
+        self.assertEqual(services.derive_interval(0.5, control), 600)
+
+    def test_mate_traits_stay_in_range_and_center_on_parent_mean(self):
+        import random as _random
+
+        parent_a = Monkey(name="A", balance=0, haste=0.4, balls=0.6)
+        parent_b = Monkey(name="B", balance=0, haste=0.6, balls=0.8)
+        rng = _random.Random(1234)
+
+        hastes = []
+        ballss = []
+        for _ in range(400):
+            haste, balls = services.mate_traits(parent_a, parent_b, rng)
+            self.assertTrue(services.TRAIT_FLOOR <= haste <= 1.0)
+            self.assertTrue(services.TRAIT_FLOOR <= balls <= 1.0)
+            hastes.append(haste)
+            ballss.append(balls)
+
+        # Averages should sit near the parents' midpoints (0.5 and 0.7).
+        self.assertAlmostEqual(sum(hastes) / len(hastes), 0.5, delta=0.1)
+        self.assertAlmostEqual(sum(ballss) / len(ballss), 0.7, delta=0.1)
+
+    def test_auto_create_breeds_traits_from_parents(self):
+        # Two distinctive parents already alive → children are bred from them.
+        Monkey.objects.create(
+            name="P1",
+            balance=1_000_000,
+            initial_balance=1_000_000,
+            haste=0.5,
+            balls=0.5,
+        )
+        Monkey.objects.create(
+            name="P2",
+            balance=1_000_000,
+            initial_balance=1_000_000,
+            haste=0.5,
+            balls=0.5,
+        )
+        fake_client = FakeKisClient(balance=4_000_000)
+
+        children = services.auto_create_monkeys(kis_client=fake_client)
+
+        self.assertEqual(len(children), 2)
+        for child in children:
+            self.assertTrue(services.TRAIT_FLOOR <= child.haste <= 1.0)
+            self.assertTrue(services.TRAIT_FLOOR <= child.balls <= 1.0)
+            self.assertEqual(
+                child.order_interval_seconds,
+                services.derive_interval(child.haste, services.get_global_control()),
+            )

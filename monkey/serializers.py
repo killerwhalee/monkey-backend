@@ -23,6 +23,8 @@ class MonkeySerializer(serializers.ModelSerializer):
             "is_system",
             "balance",
             "initial_balance",
+            "haste",
+            "balls",
             "order_interval_seconds",
             "killed_at",
             "created_at",
@@ -30,7 +32,19 @@ class MonkeySerializer(serializers.ModelSerializer):
             "recent_orders",
             "metrics",
         ]
-        read_only_fields = ["killed_at", "created_at"]
+        # order_interval_seconds is derived from haste at creation, not set directly.
+        read_only_fields = ["order_interval_seconds", "killed_at", "created_at"]
+
+    def create(self, validated_data):
+        # Manual create passes explicit traits; clamp them and derive the cadence
+        # (auto-created/mated monkeys go through services.create_monkeys instead).
+        control = services.get_global_control()
+        validated_data["haste"] = services.clamp_trait(validated_data.get("haste", 0.5))
+        validated_data["balls"] = services.clamp_trait(validated_data.get("balls", 0.5))
+        validated_data["order_interval_seconds"] = services.derive_interval(
+            validated_data["haste"], control
+        )
+        return super().create(validated_data)
 
     def get_holdings(self, obj):
         holdings = _holdings_for(obj, only_positive=True)
@@ -89,7 +103,6 @@ class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
             "time_enabled",
             "holiday_enabled",
             "manual_enabled",
-            "kill_threshold",
             "auto_create_starting_balance",
             "auto_create_min_interval_seconds",
             "auto_create_max_interval_seconds",
@@ -156,7 +169,6 @@ class DashboardSummarySerializer(serializers.Serializer):
     monkey_index = serializers.FloatField()
     monkey_index_open = serializers.FloatField()
     monkey_index_change = serializers.FloatField()
-    average_order_interval_seconds = serializers.IntegerField()
     latest_orders = OrderSerializer(many=True)
 
 
