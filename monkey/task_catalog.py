@@ -64,6 +64,15 @@ RUNNABLE_TASKS = [
         False,  # automated every N seconds; no value in manual runs
     ),
     (
+        "update_all_stock_prices",
+        monkey_tasks.update_all_stock_prices,
+        "전체 종목 시세 갱신",
+        "보유 여부와 관계없이 모든 활성 종목의 현재가를 KIS에서 새로 받아옵니다. 종목 수만큼 호출하므로 시간이 오래 걸립니다.",
+        [],
+        None,
+        True,
+    ),
+    (
         "update_held_stock_prices",
         monkey_tasks.update_held_stock_prices,
         "보유 종목 시세 갱신",

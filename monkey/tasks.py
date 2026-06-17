@@ -94,5 +94,10 @@ def update_held_stock_prices():
 
 
 @shared_task
+def update_all_stock_prices():
+    return services.update_all_stock_prices()
+
+
+@shared_task
 def reconcile_executions():
     return services.reconcile_order_executions()

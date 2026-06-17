@@ -612,6 +612,33 @@ def update_held_stock_prices(kis_client=None):
     return {"enabled": True, "updated": updated, "cache_refreshed": cache_refreshed}
 
 
+def update_all_stock_prices(kis_client=None):
+    """Refresh live prices for *every* active stock, not just the held ones.
+
+    Held-only polling (``update_held_stock_prices``) leaves never-traded stocks at
+    a 0 price; this backfills the whole active universe so order sizing and the
+    stock list show real prices. It makes one KIS call per stock under the
+    ~1 req/sec limiter, so it is slow — meant to be triggered by hand, not
+    scheduled. Not gated on market hours: KIS returns the last/closing price when
+    the market is closed.
+    """
+    kis_client = kis_client or KisClient()
+    now = timezone.now()
+    updated = 0
+    failed = 0
+    for stock in Stock.objects.filter(is_active=True).order_by("id"):
+        try:
+            price = kis_client.get_stock_price(stock.ticker)
+        except (KisClientError, ValueError):
+            failed += 1
+            continue
+        stock.current_price = price
+        stock.price_updated_at = now
+        stock.save(update_fields=["current_price", "price_updated_at"])
+        updated += 1
+    return {"updated": updated, "failed": failed}
+
+
 def reconcile_order_executions(kis_client=None, lookback_days=1):
     """Correct recently-succeeded orders with their real KIS fills.
 

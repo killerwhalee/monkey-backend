@@ -1477,6 +1477,25 @@ class HoldingsBreakdownTests(TestCase):
         result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
         self.assertEqual(result, {"market_open": False})
 
+    def test_update_all_stock_prices_prices_every_active_stock(self):
+        # self.stock is active and unheld; another active stock and a delisted one.
+        other = Stock.objects.create(market="KOSDAQ", ticker="000660", name="SK Hynix")
+        delisted = Stock.objects.create(
+            market="KOSPI", ticker="999999", name="Delisted", is_active=False
+        )
+
+        # Not gated on the market switch (left closed here).
+        result = services.update_all_stock_prices(kis_client=FakeKisClient(price=4321))
+
+        self.assertEqual(result, {"updated": 2, "failed": 0})
+        self.stock.refresh_from_db()
+        other.refresh_from_db()
+        delisted.refresh_from_db()
+        self.assertEqual(self.stock.current_price, 4321)
+        self.assertEqual(other.current_price, 4321)
+        # Delisted stocks are skipped (left at their default, unpriced).
+        self.assertIsNone(delisted.current_price)
+
 
 class ExecutionReconciliationTests(TestCase):
     def setUp(self):
