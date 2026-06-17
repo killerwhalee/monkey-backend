@@ -12,7 +12,12 @@ from rest_framework.test import APITestCase
 from market.models import Holding, Order, Stock
 from monkey import services
 from monkey.kis import KisClient
-from monkey.models import KisAccessToken, Monkey, MonkeyDailySnapshot
+from monkey.models import (
+    KisAccessToken,
+    KisAccountCache,
+    Monkey,
+    MonkeyDailySnapshot,
+)
 from monkey.serializers import build_monkey_metrics
 
 
@@ -26,6 +31,11 @@ class FakeKisClient:
         holdings=None,
         holiday=False,
         executions=None,
+        securities_value=0,
+        total_assets=0,
+        total_pl=0,
+        earning_rate=0.0,
+        environment="virtual",
     ):
         self.price = price
         self.response = response or {
@@ -39,12 +49,26 @@ class FakeKisClient:
         self.holdings = holdings or {}
         self.holiday = holiday
         self.executions = executions or {}
+        self.securities_value = securities_value
+        self.total_assets = total_assets
+        self.total_pl = total_pl
+        self.earning_rate = earning_rate
+        self.environment = environment
+        self.balance_calls = 0
 
     def get_stock_price(self, ticker):
         return self.price
 
     def get_account_balance(self, include_holdings=True):
-        return {"cash_balance": self.balance, "holdings": self.holdings}
+        self.balance_calls += 1
+        return {
+            "cash_balance": self.balance,
+            "securities_value": self.securities_value,
+            "total_assets": self.total_assets,
+            "total_pl": self.total_pl,
+            "earning_rate": self.earning_rate,
+            "holdings": self.holdings,
+        }
 
     def is_holiday(self, date=None):
         return self.holiday
@@ -1623,3 +1647,108 @@ class MonkeyListQueryCountTests(APITestCase):
         self._give_holdings(monkey_a, stocks[1:])
         self._give_holdings(monkey_b, stocks[1:])
         self.assertEqual(self._count_list_queries(), baseline)
+
+
+class AccountCacheTests(TestCase):
+    def test_build_account_summary_reads_cache_without_calling_kis(self):
+        KisAccountCache.objects.create(
+            environment="virtual",
+            cash_balance=500_000,
+            securities_value=200_000,
+            total_assets=700_000,
+            total_pl=50_000,
+            earning_rate=0.07,
+        )
+        Monkey.objects.create(name="A", balance=100_000, initial_balance=100_000)
+        client = FakeKisClient(balance=999)
+
+        summary = services.build_account_summary(kis_client=client)
+
+        # Served entirely from the cache — KIS is never queried.
+        self.assertEqual(client.balance_calls, 0)
+        self.assertEqual(summary["kis_cash_balance"], 500_000)
+        self.assertEqual(summary["kis_total_assets"], 700_000)
+        self.assertEqual(summary["kis_earning_rate"], 0.07)
+        # Unallocated cash is derived locally from the cached cash balance.
+        self.assertEqual(summary["unallocated_cash"], 400_000)
+        self.assertEqual(summary["monkey_count"], 1)
+
+    def test_build_account_summary_cold_cache_falls_back_to_live_fetch(self):
+        client = FakeKisClient(
+            balance=300_000,
+            securities_value=100_000,
+            total_assets=400_000,
+            total_pl=10_000,
+            earning_rate=0.025,
+        )
+
+        summary = services.build_account_summary(kis_client=client)
+
+        # One live fetch populated the cache, which is now served back.
+        self.assertEqual(client.balance_calls, 1)
+        self.assertEqual(summary["kis_cash_balance"], 300_000)
+        cache = KisAccountCache.objects.get(environment="virtual")
+        self.assertEqual(cache.total_assets, 400_000)
+
+    def test_update_held_stock_prices_refreshes_account_cache(self):
+        stock = Stock.objects.create(market="KOSPI", ticker="005930", name="Samsung")
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=10000)
+        Holding.objects.create(monkey=monkey, stock=stock, quantity=2)
+        services.set_trading_enabled(True)
+
+        client = FakeKisClient(
+            price=4321,
+            balance=600_000,
+            securities_value=150_000,
+            total_assets=750_000,
+        )
+        result = services.update_held_stock_prices(kis_client=client)
+
+        self.assertTrue(result["cache_refreshed"])
+        cache = KisAccountCache.objects.get(environment="virtual")
+        self.assertEqual(cache.cash_balance, 600_000)
+        self.assertEqual(cache.total_assets, 750_000)
+
+    def test_update_held_stock_prices_skips_cache_when_market_closed(self):
+        result = services.update_held_stock_prices(kis_client=FakeKisClient())
+        self.assertEqual(result, {"market_open": False})
+        self.assertFalse(KisAccountCache.objects.exists())
+
+
+class SystemMonkeyVisibilityTests(APITestCase):
+    def setUp(self):
+        self.system = services.get_or_create_system_monkey()
+        self.trader = Monkey.objects.create(
+            name="A", balance=1000, initial_balance=1000
+        )
+
+    def test_guest_list_excludes_system_monkey(self):
+        response = self.client.get(reverse("monkey-list"))
+        self.assertEqual(response.status_code, 200)
+        ids = {row["id"] for row in response.data}
+        self.assertIn(self.trader.id, ids)
+        self.assertNotIn(self.system.id, ids)
+
+    def test_staff_list_includes_system_monkey(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+
+        response = self.client.get(reverse("monkey-list"))
+        self.assertEqual(response.status_code, 200)
+        rows = {row["id"]: row for row in response.data}
+        self.assertIn(self.system.id, rows)
+        self.assertTrue(rows[self.system.id]["is_system"])
+        self.assertFalse(rows[self.trader.id]["is_system"])
+
+    def test_summary_excludes_system_monkey_even_for_staff(self):
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+
+        response = self.client.get(reverse("monkey-summary"))
+        self.assertEqual(response.status_code, 200)
+        ids = {row["id"] for row in response.data}
+        self.assertNotIn(self.system.id, ids)

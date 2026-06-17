@@ -3,6 +3,7 @@ import random
 import time
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import OperationalError, transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -11,6 +12,7 @@ from market.models import Holding, Order, Stock
 from monkey.kis import KisClient, KisClientError
 from monkey.models import (
     GlobalMonkeyControl,
+    KisAccountCache,
     Monkey,
     MonkeyDailySnapshot,
     MonkeyIndexBaseline,
@@ -525,7 +527,17 @@ def update_held_stock_prices(kis_client=None):
         stock.price_updated_at = now
         stock.save(update_fields=["current_price", "price_updated_at"])
         updated += 1
-    return {"enabled": True, "updated": updated}
+
+    # Piggyback the account-balance cache refresh on this market-hours poll so the
+    # admin "내 자산 현황" card serves cached figures (no live KIS call per request).
+    cache_refreshed = False
+    try:
+        refresh_account_cache(kis_client)
+        cache_refreshed = True
+    except (KisClientError, ValueError):
+        pass
+
+    return {"enabled": True, "updated": updated, "cache_refreshed": cache_refreshed}
 
 
 def reconcile_order_executions(kis_client=None, lookback_days=1):
@@ -570,27 +582,52 @@ def reconcile_order_executions(kis_client=None, lookback_days=1):
     return {"reconciled": reconciled}
 
 
-def build_account_summary(kis_client=None):
-    """Live KIS-account asset snapshot for the manage page.
+def refresh_account_cache(kis_client=None):
+    """Fetch the live KIS balance and store it in ``KisAccountCache``.
 
-    Asset figures (cash/holdings/total/P&L/earning rate) come straight from the
-    KIS account inquiry — not the local DB — so they reflect the real paper
-    account regardless of monkey bookkeeping. Monkey counts and unallocated cash
-    are still derived locally since they have no KIS equivalent.
+    Called from the market-hours poll (``update_held_stock_prices``) so the
+    manage card can serve the cached figures instead of a live KIS round-trip.
+    Returns the refreshed cache row.
     """
     kis_client = kis_client or KisClient()
     balance = kis_client.get_account_balance(include_holdings=False)
+    cache, _ = KisAccountCache.objects.update_or_create(
+        environment=kis_client.environment,
+        defaults={
+            "cash_balance": balance["cash_balance"],
+            "securities_value": balance["securities_value"],
+            "total_assets": balance["total_assets"],
+            "total_pl": balance["total_pl"],
+            "earning_rate": balance["earning_rate"],
+        },
+    )
+    return cache
+
+
+def build_account_summary(kis_client=None):
+    """KIS-account asset snapshot for the manage page, served from the DB cache.
+
+    Asset figures (cash/holdings/total/P&L/earning rate) come from ``KisAccountCache``,
+    refreshed during market hours by ``update_held_stock_prices`` — so this view
+    never makes a live KIS call in steady state. On a cold cache (first ever load,
+    or before the first market session) we fall back to one live fetch to populate
+    it. Monkey counts and unallocated cash are derived locally.
+    """
+    environment = settings.KIS_ENVIRONMENT
+    cache = KisAccountCache.objects.filter(environment=environment).first()
+    if cache is None:
+        cache = refresh_account_cache(kis_client)
 
     monkeys = list(Monkey.objects.filter(is_system=False))
     total_monkey_balance = sum(monkey.balance for monkey in monkeys)
 
     return {
-        "kis_cash_balance": balance["cash_balance"],
-        "kis_holdings_value": balance["securities_value"],
-        "kis_total_assets": balance["total_assets"],
-        "kis_total_pl": balance["total_pl"],
-        "kis_earning_rate": balance["earning_rate"],
-        "unallocated_cash": balance["cash_balance"] - total_monkey_balance,
+        "kis_cash_balance": cache.cash_balance,
+        "kis_holdings_value": cache.securities_value,
+        "kis_total_assets": cache.total_assets,
+        "kis_total_pl": cache.total_pl,
+        "kis_earning_rate": cache.earning_rate,
+        "unallocated_cash": cache.cash_balance - total_monkey_balance,
         "monkey_count": len(monkeys),
         "active_monkey_count": sum(monkey.is_active for monkey in monkeys),
     }
