@@ -76,6 +76,13 @@ class KisClient:
     HOLIDAY_TR_ID = "CTCA0903R"
     DAILY_CCLD_TR_ID = "VTTC0081R"
 
+    # Holdings pagination cap. Paper trading returns ~20 holdings per page, and a
+    # single shared account can hold close to the whole KRX universe (~2,900
+    # tickers) as monkeys buy widely — so the cap must clear that with headroom.
+    # It only guards against a malformed continuation loop; normal paging stops
+    # on the tr_cont flag well before this.
+    MAX_BALANCE_PAGES = 500
+
     # The holiday endpoint is not served on the virtual/paper domain
     # (모의투자 미지원), so it is always queried against production.
     HOLIDAY_BASE_URL = "https://openapi.koreainvestment.com:9443"
@@ -162,7 +169,7 @@ class KisClient:
         ctx_fk = ""
         ctx_nk = ""
         tr_cont = ""
-        for _ in range(50):  # hard cap against a malformed continuation loop
+        for _ in range(self.MAX_BALANCE_PAGES):  # guard against a runaway loop
             response = self._execute(
                 "GET",
                 f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
