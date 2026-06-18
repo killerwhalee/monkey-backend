@@ -1,21 +1,28 @@
 from celery import shared_task
 
 from monkey import services
-from monkey.kis import KisClient
+from monkey.kis import KisClient, KisClientError
+from monkey.models import Account
 
 
 @shared_task
 def update_token():
-    token = KisClient().refresh_access_token()
-    return {
-        "environment": token.environment,
-        "expires_at": token.expires_at.isoformat(),
-    }
+    """Refresh the KIS OAuth token for every active account."""
+    refreshed = []
+    for account in Account.objects.filter(is_active=True).order_by("id"):
+        try:
+            token = KisClient(account).refresh_access_token()
+        except KisClientError:
+            continue
+        refreshed.append(
+            {"account_id": account.id, "expires_at": token.expires_at.isoformat()}
+        )
+    return {"refreshed": refreshed}
 
 
 @shared_task
 def get_stock_price(ticker):
-    return KisClient().get_stock_price(ticker)
+    return services.get_account_free_client().get_stock_price(ticker)
 
 
 @shared_task
@@ -28,6 +35,8 @@ def run_monkey(monkey_id):
     if not services.get_global_control().enabled:
         return {"enabled": False, "monkey_id": monkey_id}
     order = services.run_random_monkey_order(monkey_id)
+    if order is None:
+        return {"enabled": True, "monkey_id": monkey_id, "order_id": None}
     return {"order_id": order.id, "status": order.status}
 
 
@@ -35,15 +44,17 @@ def run_monkey(monkey_id):
 def run_system_monkey():
     if not services.get_global_control().market_open:
         return {"market_open": False}
-    order = services.run_system_monkey_order()
-    if order is None:
-        return {"enabled": True, "order_id": None}
-    return {"enabled": True, "order_id": order.id, "status": order.status}
+    orders = services.run_system_monkey_order()
+    return {"enabled": True, "order_ids": [order.id for order in orders]}
 
 
 @shared_task
 def check_holiday():
-    is_holiday = KisClient().is_holiday()
+    try:
+        client = services.get_account_free_client()
+    except services.NoAccountAvailableError:
+        return {"skipped": "no_account"}
+    is_holiday = client.is_holiday()
     note = "휴장일 (자동)" if is_holiday else "영업일 (자동)"
     services.set_holiday_closed(is_holiday, note=note)
     services.sync_monkey_periodic_tasks()

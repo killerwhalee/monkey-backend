@@ -4,7 +4,6 @@ import random
 import time
 from datetime import timedelta
 
-from django.conf import settings
 from django.db import OperationalError, transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -12,6 +11,7 @@ from django.utils import timezone
 from market.models import Holding, Order, Stock
 from monkey.kis import KisClient, KisClientError
 from monkey.models import (
+    Account,
     GlobalMonkeyControl,
     KisAccountCache,
     Monkey,
@@ -30,6 +30,67 @@ MONKEY_INDEX_BASE = 1000.0
 
 class InsufficientCashError(Exception):
     """Raised when there isn't enough unallocated KIS cash to create monkeys."""
+
+
+class NoAccountAvailableError(Exception):
+    """Raised when an account-free task has no registered account to borrow keys from."""
+
+
+def active_mock_accounts():
+    """Active MOCK accounts — the only accounts that host monkeys."""
+    return Account.objects.filter(
+        is_active=True, account_type=Account.AccountType.MOCK
+    ).order_by("id")
+
+
+def soft_delete_account(account):
+    """Retire an account: wipe its keys, mark it inactive, kill its monkeys, drop
+    its holdings, and clear its cached token/balance. Orders are kept for history.
+
+    Monkeys are set DEAD (retained for the gravestone view) rather than deleted,
+    and their holdings are *deleted* (not transferred to a system monkey) per the
+    project's account-removal policy.
+    """
+    with transaction.atomic():
+        monkey_ids = list(
+            Monkey.objects.filter(account=account).values_list("id", flat=True)
+        )
+        Holding.objects.filter(monkey_id__in=monkey_ids).delete()
+        # Mark every monkey on the account DEAD (Monkey.save() drops each task).
+        for monkey in Monkey.objects.filter(account=account):
+            monkey.state = Monkey.State.DEAD
+            monkey.killed_at = timezone.now()
+            monkey.save(update_fields=["state", "killed_at"])
+
+        KisAccountCache.objects.filter(account=account).delete()
+        # Token is a real KIS secret; drop it too. (CASCADE would also handle this
+        # on a hard delete, but soft-delete keeps the row.)
+        from monkey.models import KisAccessToken
+
+        KisAccessToken.objects.filter(account=account).delete()
+
+        account.app_key = ""
+        account.app_secret = ""
+        account.is_active = False
+        account.save(update_fields=["app_key", "app_secret", "is_active", "updated_at"])
+    return account
+
+
+def get_account_free_client():
+    """Build a ``KisClient`` for tasks that don't act on a specific account
+    (price polling, holiday check). Prefer a REAL account (~18 req/s); otherwise
+    fall back to any active MOCK account (~1 req/s)."""
+    account = (
+        Account.objects.filter(
+            is_active=True, account_type=Account.AccountType.REAL
+        ).first()
+        or Account.objects.filter(
+            is_active=True, account_type=Account.AccountType.MOCK
+        ).first()
+    )
+    if account is None:
+        raise NoAccountAvailableError("등록된 활성 계좌가 없습니다.")
+    return KisClient(account)
 
 
 def get_global_control():
@@ -296,6 +357,9 @@ def kill_monkey(monkey: Monkey) -> Monkey:
     monkey.state = Monkey.State.DEAD
     monkey.killed_at = timezone.now()
     monkey.save(update_fields=["state", "killed_at"])
+    from monkey import realtime
+
+    realtime.publish_monkey_updated(monkey)
     return monkey
 
 
@@ -441,6 +505,9 @@ def record_index_tick():
     else:
         value = baseline.base_index
     tick = MonkeyIndexTick.objects.create(value=value)
+    from monkey import realtime
+
+    realtime.publish_index_tick(value, tick.recorded_at)
     return {"enabled": True, "tick_id": tick.id, "value": value}
 
 
@@ -581,7 +648,10 @@ def update_held_stock_prices(kis_client=None):
     if not get_global_control().market_open:
         return {"market_open": False}
 
-    kis_client = kis_client or KisClient()
+    try:
+        kis_client = kis_client or get_account_free_client()
+    except NoAccountAvailableError:
+        return {"enabled": True, "updated": 0, "cache_refreshed": 0}
     stock_ids = list(
         Holding.objects.filter(quantity__gt=0, stock__is_active=True)
         .values_list("stock_id", flat=True)
@@ -600,14 +670,15 @@ def update_held_stock_prices(kis_client=None):
         stock.save(update_fields=["current_price", "price_updated_at"])
         updated += 1
 
-    # Piggyback the account-balance cache refresh on this market-hours poll so the
+    # Refresh each mock account's balance cache on this market-hours poll so the
     # admin "내 자산 현황" card serves cached figures (no live KIS call per request).
-    cache_refreshed = False
-    try:
-        refresh_account_cache(kis_client)
-        cache_refreshed = True
-    except (KisClientError, ValueError):
-        pass
+    cache_refreshed = 0
+    for account in active_mock_accounts():
+        try:
+            refresh_account_cache(account)
+            cache_refreshed += 1
+        except (KisClientError, ValueError):
+            pass
 
     return {"enabled": True, "updated": updated, "cache_refreshed": cache_refreshed}
 
@@ -622,7 +693,7 @@ def update_all_stock_prices(kis_client=None):
     scheduled. Not gated on market hours: KIS returns the last/closing price when
     the market is closed.
     """
-    kis_client = kis_client or KisClient()
+    kis_client = kis_client or get_account_free_client()
     now = timezone.now()
     updated = 0
     failed = 0
@@ -639,59 +710,60 @@ def update_all_stock_prices(kis_client=None):
     return {"updated": updated, "failed": failed}
 
 
-def reconcile_order_executions(kis_client=None, lookback_days=1):
-    """Correct recently-succeeded orders with their real KIS fills.
+def reconcile_order_executions(lookback_days=1):
+    """Correct recently-succeeded orders with their real KIS fills, per account.
 
     Market orders fill at prices that differ from the pre-trade estimate we
-    optimistically recorded. This polls the daily order-execution inquiry and,
-    matching by KIS order number (ODNO), updates each order's executed quantity
-    and price so the FIFO average-price/earning-rate math reflects reality. Each
-    order maps to one ODNO, so multiple buys/sells reconcile independently.
+    optimistically recorded. For each mock account this polls the daily
+    order-execution inquiry and, matching by KIS order number (ODNO), updates each
+    of that account's orders with the executed quantity/price so the FIFO
+    average-price/earning-rate math reflects reality.
     """
     if get_global_control().market_open:
         return {"skipped": "market_open"}
 
-    kis_client = kis_client or KisClient()
     start = timezone.localdate() - timedelta(days=lookback_days)
-    executions = kis_client.get_daily_order_executions(start_date=start)
-    if not executions:
-        return {"reconciled": 0}
-
-    reconciled = 0
     cutoff = timezone.now() - timedelta(days=lookback_days + 1)
-    orders = Order.objects.filter(
-        status=Order.StatusChoices.SUCCEEDED,
-        created_at__gte=cutoff,
-    ).exclude(kis_order_id="")
-    for order in orders:
-        fill = executions.get(order.kis_order_id.lstrip("0"))
-        if not fill:
+    reconciled = 0
+    for account in active_mock_accounts():
+        executions = KisClient(account).get_daily_order_executions(start_date=start)
+        if not executions:
             continue
-        executed_quantity = fill["executed_quantity"]
-        avg_price = fill["avg_price"] or order.executed_price
-        if (
-            order.executed_quantity == executed_quantity
-            and order.executed_price == avg_price
-        ):
-            continue
-        order.executed_quantity = executed_quantity
-        order.executed_price = avg_price
-        order.save(update_fields=["executed_quantity", "executed_price", "updated_at"])
-        reconciled += 1
+        orders = Order.objects.filter(
+            monkey__account=account,
+            status=Order.StatusChoices.SUCCEEDED,
+            created_at__gte=cutoff,
+        ).exclude(kis_order_id="")
+        for order in orders:
+            fill = executions.get(order.kis_order_id.lstrip("0"))
+            if not fill:
+                continue
+            executed_quantity = fill["executed_quantity"]
+            avg_price = fill["avg_price"] or order.executed_price
+            if (
+                order.executed_quantity == executed_quantity
+                and order.executed_price == avg_price
+            ):
+                continue
+            order.executed_quantity = executed_quantity
+            order.executed_price = avg_price
+            order.save(
+                update_fields=["executed_quantity", "executed_price", "updated_at"]
+            )
+            reconciled += 1
     return {"reconciled": reconciled}
 
 
-def refresh_account_cache(kis_client=None):
-    """Fetch the live KIS balance and store it in ``KisAccountCache``.
+def refresh_account_cache(account, kis_client=None):
+    """Fetch one account's live KIS balance and store it in ``KisAccountCache``.
 
-    Called from the market-hours poll (``update_held_stock_prices``) so the
-    manage card can serve the cached figures instead of a live KIS round-trip.
-    Returns the refreshed cache row.
+    Called per mock account from the market-hours poll so the manage card can
+    serve cached figures instead of a live KIS round-trip. Returns the cache row.
     """
-    kis_client = kis_client or KisClient()
+    kis_client = kis_client or KisClient(account)
     balance = kis_client.get_account_balance(include_holdings=False)
     cache, _ = KisAccountCache.objects.update_or_create(
-        environment=kis_client.environment,
+        account=account,
         defaults={
             "cash_balance": balance["cash_balance"],
             "securities_value": balance["securities_value"],
@@ -703,24 +775,25 @@ def refresh_account_cache(kis_client=None):
     return cache
 
 
-def build_account_summary(kis_client=None):
-    """KIS-account asset snapshot for the manage page, served from the DB cache.
+def build_account_summary(account, kis_client=None):
+    """One account's asset snapshot for the manage page, served from the DB cache.
 
-    Asset figures (cash/holdings/total/P&L/earning rate) come from ``KisAccountCache``,
-    refreshed during market hours by ``update_held_stock_prices`` — so this view
-    never makes a live KIS call in steady state. On a cold cache (first ever load,
-    or before the first market session) we fall back to one live fetch to populate
-    it. Monkey counts and unallocated cash are derived locally.
+    Asset figures come from ``KisAccountCache``, refreshed during market hours —
+    so this view never makes a live KIS call in steady state. On a cold cache we
+    fall back to one live fetch. Monkey counts and unallocated cash are scoped to
+    the account.
     """
-    environment = settings.KIS_ENVIRONMENT
-    cache = KisAccountCache.objects.filter(environment=environment).first()
+    cache = KisAccountCache.objects.filter(account=account).first()
     if cache is None:
-        cache = refresh_account_cache(kis_client)
+        cache = refresh_account_cache(account, kis_client)
 
-    monkeys = list(Monkey.objects.filter(is_system=False))
+    monkeys = list(Monkey.objects.filter(is_system=False, account=account))
     total_monkey_balance = sum(monkey.balance for monkey in monkeys)
 
     return {
+        "account_id": account.id,
+        "display_id": account.display_id,
+        "account_type": account.account_type,
         "kis_cash_balance": cache.cash_balance,
         "kis_holdings_value": cache.securities_value,
         "kis_total_assets": cache.total_assets,
@@ -732,16 +805,27 @@ def build_account_summary(kis_client=None):
     }
 
 
-def unallocated_cash(kis_client=None):
-    """KIS account cash not yet allocated to a *living* monkey.
+def list_account_summaries():
+    """Per-account asset snapshots for every active mock account."""
+    summaries = []
+    for account in active_mock_accounts():
+        try:
+            summaries.append(build_account_summary(account))
+        except (KisClientError, ValueError):
+            continue
+    return summaries
 
-    Dead monkeys keep their ``balance`` (for the future gravestone view) but are
-    excluded here, so their cash is freed back into circulation for new monkeys.
+
+def unallocated_cash(account, kis_client=None):
+    """One account's KIS cash not yet allocated to a *living* monkey.
+
+    Dead monkeys keep their ``balance`` (for the gravestone view) but are excluded
+    here, so their cash is freed back into circulation for new monkeys.
     """
-    kis_client = kis_client or KisClient()
+    kis_client = kis_client or KisClient(account)
     kis_cash = kis_client.get_account_balance(include_holdings=False)["cash_balance"]
     allocated = (
-        Monkey.objects.filter(is_system=False)
+        Monkey.objects.filter(is_system=False, account=account)
         .exclude(state=Monkey.State.DEAD)
         .aggregate(total=Sum("balance"))["total"]
         or 0
@@ -779,11 +863,11 @@ def mate_traits(parent_a, parent_b, rng=None):
     )
 
 
-def derive_interval(haste, control):
-    """Order interval interpolated across the configured min..max range by haste:
+def derive_interval(haste, account):
+    """Order interval interpolated across the account's min..max range by haste:
     haste=1 → min (fastest), haste=0 → max (slowest)."""
-    low = control.auto_create_min_interval_seconds
-    high = control.auto_create_max_interval_seconds
+    low = account.auto_create_min_interval_seconds
+    high = account.auto_create_max_interval_seconds
     return round(low + (high - low) * (1 - haste))
 
 
@@ -795,57 +879,66 @@ def _spawn_traits(parent_pool, rng):
     return random_trait(rng), random_trait(rng)
 
 
-def create_monkeys(count, starting_balance, rng=None):
-    """Create ``count`` monkeys, each bred from two random alive monkeys (or with
-    random traits when fewer than two exist). The order interval is derived from
-    the child's haste. Individual saves (not bulk_create) so Monkey.save() fires
-    and creates the per-monkey PeriodicTask."""
+def create_monkeys(account, count, starting_balance, rng=None):
+    """Create ``count`` monkeys on ``account``, each bred from two random alive
+    monkeys on the same account (or random traits when fewer than two exist). The
+    order interval is derived from the child's haste. Individual saves (not
+    bulk_create) so Monkey.save() fires and creates the per-monkey PeriodicTask."""
     rng = rng or random
-    control = get_global_control()
-    # Snapshot the parent pool once so it's deterministic for a given rng seed.
-    parent_pool = list(_alive_monkeys())
+    # Snapshot the parent pool (this account's alive monkeys) once so it's
+    # deterministic for a given rng seed.
+    parent_pool = list(_alive_monkeys().filter(account=account))
     monkeys = []
     for _ in range(count):
         haste, balls = _spawn_traits(parent_pool, rng)
         monkey = Monkey(
+            account=account,
             name=generate_monkey_name(),
             balance=starting_balance,
             initial_balance=starting_balance,
             haste=haste,
             balls=balls,
-            order_interval_seconds=derive_interval(haste, control),
+            order_interval_seconds=derive_interval(haste, account),
         )
         monkey.save()
         monkeys.append(monkey)
     return monkeys
 
 
-def create_monkeys_checked(count, starting_balance, kis_client=None):
-    """Create monkeys only if the KIS account has enough unallocated cash.
+def create_monkeys_checked(account, count, starting_balance, kis_client=None):
+    """Create monkeys on ``account`` only if it has enough unallocated cash.
 
     Used by the admin bulk-create path; raises ``InsufficientCashError`` instead
     of silently over-allocating beyond the real account balance.
     """
-    available = unallocated_cash(kis_client=kis_client)
+    available = unallocated_cash(account, kis_client=kis_client)
     needed = count * starting_balance
     if needed > available:
         raise InsufficientCashError(
             f"미배정 잔고가 부족합니다. 필요: {needed:,}원, 가용: {available:,}원."
         )
-    return create_monkeys(count=count, starting_balance=starting_balance)
+    return create_monkeys(account, count=count, starting_balance=starting_balance)
 
 
-def auto_create_monkeys(kis_client=None):
-    """Create as many new monkeys as the KIS account's unallocated cash affords."""
-    kis_client = kis_client or KisClient()
-    starting_balance = get_global_control().auto_create_starting_balance
-    if starting_balance <= 0:
-        return []
-    available = unallocated_cash(kis_client=kis_client)
-    count = available // starting_balance
-    if count <= 0:
-        return []
-    return create_monkeys(count=count, starting_balance=starting_balance)
+def auto_create_monkeys():
+    """For each active mock account, create as many monkeys as its unallocated
+    cash affords."""
+    created = []
+    for account in active_mock_accounts():
+        starting_balance = account.auto_create_starting_balance
+        if starting_balance <= 0:
+            continue
+        try:
+            available = unallocated_cash(account)
+        except (KisClientError, ValueError):
+            continue
+        count = available // starting_balance
+        if count <= 0:
+            continue
+        created.extend(
+            create_monkeys(account, count=count, starting_balance=starting_balance)
+        )
+    return created
 
 
 def run_active_monkeys():
@@ -853,7 +946,12 @@ def run_active_monkeys():
         return {"enabled": False, "orders": 0}
 
     orders = []
-    for monkey in Monkey.objects.filter(state=Monkey.State.ACTIVE).order_by("id"):
+    active = (
+        Monkey.objects.filter(state=Monkey.State.ACTIVE, account__is_active=True)
+        .exclude(account__isnull=True)
+        .order_by("id")
+    )
+    for monkey in active:
         try:
             orders.append(run_random_monkey_order(monkey.id))
         except Exception:
@@ -874,7 +972,8 @@ def _buy_quantity(monkey, stock, kis_client=None):
     price = stock.current_price
     if not price:
         try:
-            price = (kis_client or KisClient()).get_stock_price(stock.ticker)
+            client = kis_client or KisClient(monkey.account)
+            price = client.get_stock_price(stock.ticker)
         except (KisClientError, ValueError):
             return 0
     if not price:
@@ -885,7 +984,13 @@ def _buy_quantity(monkey, stock, kis_client=None):
 
 def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
     rng = rng or random
-    monkey = Monkey.objects.get(pk=monkey_id)
+    monkey = Monkey.objects.select_related("account").get(pk=monkey_id)
+    # Monkeys only ever trade on an active mock account. A monkey with no account
+    # (orphaned) or whose account is gone/inactive simply can't trade.
+    if kis_client is None:
+        if monkey.account is None or not monkey.account.is_active:
+            return None
+        kis_client = KisClient(monkey.account)
     order_type = rng.choice([Order.OrderTypeChoices.BUY, Order.OrderTypeChoices.SELL])
 
     if order_type == Order.OrderTypeChoices.BUY:
@@ -947,31 +1052,35 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
 
 
 def run_system_monkey_order(kis_client=None, rng=None):
-    """Sell off one random system-monkey holding (full quantity) through KIS.
+    """Sell off one random system-monkey holding (full quantity) per account.
 
-    The system monkey gradually liquidates the orphaned/dead-monkey holdings handed
-    to it. It never buys and never dies, and its sale proceeds are not retained (see
-    _apply_confirmed_order) — freed cash returns to the unallocated pool. Returns
-    None when it has nothing to sell.
+    Each account's system monkey gradually liquidates the orphaned/dead-monkey
+    holdings handed to it. It never buys and never dies, and its sale proceeds are
+    not retained (see _apply_confirmed_order) — freed cash returns to that
+    account's unallocated pool. Returns the list of placed orders (may be empty).
     """
     rng = rng or random
-    system_monkey = get_or_create_system_monkey()
-    holdings = list(
-        Holding.objects.filter(monkey=system_monkey, quantity__gt=0).select_related(
-            "stock"
+    orders = []
+    for account in active_mock_accounts():
+        system_monkey = get_or_create_system_monkey(account)
+        holdings = list(
+            Holding.objects.filter(monkey=system_monkey, quantity__gt=0).select_related(
+                "stock"
+            )
         )
-    )
-    if not holdings:
-        return None
-
-    holding = rng.choice(holdings)
-    return submit_monkey_order(
-        monkey_id=system_monkey.id,
-        stock_id=holding.stock_id,
-        order_type=Order.OrderTypeChoices.SELL,
-        quantity=holding.quantity,
-        kis_client=kis_client,
-    )
+        if not holdings:
+            continue
+        holding = rng.choice(holdings)
+        order = submit_monkey_order(
+            monkey_id=system_monkey.id,
+            stock_id=holding.stock_id,
+            order_type=Order.OrderTypeChoices.SELL,
+            quantity=holding.quantity,
+            kis_client=kis_client or KisClient(account),
+        )
+        if order is not None:
+            orders.append(order)
+    return orders
 
 
 def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=None):
@@ -982,9 +1091,12 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     and the "bought but no holding" money-loss bug). Only after KIS confirms the
     fill do we mutate balance/Holding inside a short, retried atomic block.
     """
-    monkey = Monkey.objects.get(pk=monkey_id)
+    monkey = Monkey.objects.select_related("account").get(pk=monkey_id)
     stock = Stock.objects.get(pk=stock_id)
-    kis_client = kis_client or KisClient()
+    if kis_client is None:
+        if monkey.account is None:
+            return None
+        kis_client = KisClient(monkey.account)
 
     order = Order.objects.create(
         monkey=monkey,
@@ -1063,6 +1175,10 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     _apply_confirmed_order(
         order, monkey_id, stock_id, order_type, quantity, estimated_price, total_price
     )
+    # Push the committed order to the live dashboard feed (best-effort).
+    from monkey import realtime
+
+    realtime.publish_order(order)
     return order
 
 
@@ -1163,12 +1279,13 @@ def _placeholder_stock(ticker="UNKNOWN"):
     return stock
 
 
-def get_or_create_system_monkey():
-    """Hidden monkey that absorbs/liquidates orphaned real-account positions."""
+def get_or_create_system_monkey(account):
+    """Per-account hidden monkey that absorbs/liquidates orphaned positions."""
     monkey, _ = Monkey.objects.get_or_create(
         is_system=True,
+        account=account,
         defaults={
-            "name": "(시스템)",
+            "name": f"(시스템 {account.display_id})",
             "state": Monkey.State.INACTIVE,
             "balance": 0,
             "initial_balance": 0,
@@ -1189,10 +1306,10 @@ def transfer_holdings_to_system_monkey(monkey, stock_ids=None):
     Deliberate exception to "never mutate Holding outside submit_monkey_order" —
     this is a bookkeeping move, not a trade, same as _clamp_phantom_holdings.
     """
-    if monkey.is_system:
+    if monkey.is_system or monkey.account is None:
         return []
 
-    system_monkey = get_or_create_system_monkey()
+    system_monkey = get_or_create_system_monkey(monkey.account)
     transferred = []
     with transaction.atomic():
         holdings = Holding.objects.select_for_update().filter(
@@ -1215,16 +1332,17 @@ def transfer_holdings_to_system_monkey(monkey, stock_ids=None):
     return transferred
 
 
-def _absorb_excess(ticker, excess_qty):
-    """A ticker is held in the real KIS account but not owned by any monkey locally.
+def _absorb_excess(account, ticker, excess_qty):
+    """A ticker is held in this account's real KIS balance but not owned by any of
+    its monkeys locally.
 
-    Assign the excess to the hidden system monkey; its periodic task sells it off
-    later, so nothing is liquidated here.
+    Assign the excess to the account's system monkey; its periodic task sells it
+    off later, so nothing is liquidated here.
     """
     stock = Stock.objects.filter(short_code=ticker).order_by(
         "id"
     ).first() or _placeholder_stock(ticker)
-    system_monkey = get_or_create_system_monkey()
+    system_monkey = get_or_create_system_monkey(account)
 
     holding, _ = Holding.objects.get_or_create(
         monkey=system_monkey, stock=stock, defaults={"quantity": 0}
@@ -1262,8 +1380,9 @@ def _succeeded_order_net(monkey_id, stock_id):
     return net
 
 
-def _clamp_phantom_holdings(ticker, phantom_qty):
-    """Reduce local Holdings for ``ticker`` by ``phantom_qty`` to match reality.
+def _clamp_phantom_holdings(account, ticker, phantom_qty):
+    """Reduce this account's local Holdings for ``ticker`` by ``phantom_qty`` to
+    match reality.
 
     Attribution is order-history-aware: phantom shares are docked first from the
     monkeys whose Holding exceeds their own succeeded-order net (the demonstrable
@@ -1275,9 +1394,9 @@ def _clamp_phantom_holdings(ticker, phantom_qty):
     submit_monkey_order" — this is a reconciliation sweep, not a trade.
     """
     holdings = list(
-        Holding.objects.filter(stock__short_code=ticker, quantity__gt=0).select_related(
-            "stock"
-        )
+        Holding.objects.filter(
+            monkey__account=account, stock__short_code=ticker, quantity__gt=0
+        ).select_related("stock")
     )
     remaining = phantom_qty
     affected = []
@@ -1319,20 +1438,22 @@ def _clamp_phantom_holdings(ticker, phantom_qty):
     }
 
 
-def reconcile_holdings(kis_client=None):
-    """Compare real KIS account holdings against the local ledger and fix mismatches.
+def reconcile_holdings(account, kis_client=None):
+    """Compare one account's real KIS holdings against its local ledger and fix
+    mismatches.
 
-    Real > local ("leaked" stock untracked by any monkey) is absorbed into the
-    hidden system monkey and sold off. Local > real ("phantom" holdings, the
-    local ledger overcounts reality) is clamped down to match reality.
+    Real > local ("leaked" stock untracked by any of this account's monkeys) is
+    absorbed into the account's system monkey and sold off. Local > real
+    ("phantom" holdings, the local ledger overcounts reality) is clamped down to
+    match reality.
     """
-    kis_client = kis_client or KisClient()
+    kis_client = kis_client or KisClient(account)
     # KIS reports holdings keyed by the 6-digit pdno, so join the local ledger on
     # Stock.short_code (last 6 digits) — tickers may carry a prefix (e.g. Q610039)
     # that the pdno omits, which would otherwise never match.
     real = kis_client.get_account_balance()["holdings"]
     local = dict(
-        Holding.objects.filter(quantity__gt=0)
+        Holding.objects.filter(monkey__account=account, quantity__gt=0)
         .values("stock__short_code")
         .annotate(total=Sum("quantity"))
         .values_list("stock__short_code", "total")
@@ -1344,9 +1465,9 @@ def reconcile_holdings(kis_client=None):
         real_qty = real.get(code, 0)
         local_qty = local.get(code, 0)
         if real_qty > local_qty:
-            absorbed.append(_absorb_excess(code, real_qty - local_qty))
+            absorbed.append(_absorb_excess(account, code, real_qty - local_qty))
         elif local_qty > real_qty:
-            clamped.append(_clamp_phantom_holdings(code, local_qty - real_qty))
+            clamped.append(_clamp_phantom_holdings(account, code, local_qty - real_qty))
 
     return {"absorbed": absorbed, "clamped": clamped}
 
@@ -1367,8 +1488,14 @@ def run_daily_maintenance():
 
     killed = kill_inactive_monkeys()
 
-    kis_client = KisClient()
-    reconciliation = reconcile_holdings(kis_client=kis_client)
+    reconciliation = []
+    for account in active_mock_accounts():
+        try:
+            reconciliation.append(
+                {"account_id": account.id, **reconcile_holdings(account)}
+            )
+        except (KisClientError, ValueError):
+            continue
 
     by_monkey = {}
     for holding in Holding.objects.filter(
