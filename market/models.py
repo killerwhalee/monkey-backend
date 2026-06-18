@@ -118,7 +118,12 @@ class Order(models.Model):
     class StatusChoices(models.TextChoices):
         CREATED = "created", "Created"
         SKIPPED = "skipped", "Skipped"
+        # SUBMITTED = accepted by KIS, awaiting fill (reserves the monkey's
+        # funds/shares); EXECUTED = real fills applied to the local ledger.
         SUBMITTED = "submitted", "Submitted"
+        EXECUTED = "executed", "Executed"
+        # Legacy: orders applied under the old "accepted == filled" scheme. Kept
+        # for back-compat; migrated to EXECUTED by data migration. No longer set.
         SUCCEEDED = "succeeded", "Succeeded"
         FAILED = "failed", "Failed"
 
