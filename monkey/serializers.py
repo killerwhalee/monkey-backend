@@ -3,7 +3,7 @@ from rest_framework import serializers
 from market.models import Holding, Order
 from market.serializers import HoldingSerializer, OrderSerializer
 from monkey import services
-from monkey.models import GlobalMonkeyControl, KisAccessToken, Monkey
+from monkey.models import Account, GlobalMonkeyControl, KisAccessToken, Monkey
 
 
 class MonkeySerializer(serializers.ModelSerializer):
@@ -17,6 +17,7 @@ class MonkeySerializer(serializers.ModelSerializer):
         model = Monkey
         fields = [
             "id",
+            "account",
             "name",
             "state",
             "is_active",
@@ -35,14 +36,24 @@ class MonkeySerializer(serializers.ModelSerializer):
         # order_interval_seconds is derived from haste at creation, not set directly.
         read_only_fields = ["order_interval_seconds", "killed_at", "created_at"]
 
+    def validate_account(self, account):
+        if account is not None and not account.is_mock:
+            raise serializers.ValidationError(
+                "원숭이는 모의투자 계좌에만 배정할 수 있습니다."
+            )
+        return account
+
     def create(self, validated_data):
         # Manual create passes explicit traits; clamp them and derive the cadence
-        # (auto-created/mated monkeys go through services.create_monkeys instead).
-        control = services.get_global_control()
+        # from the monkey's account (auto-created/mated monkeys go through
+        # services.create_monkeys instead).
+        account = validated_data.get("account")
+        if account is None:
+            raise serializers.ValidationError({"account": "계좌를 지정해야 합니다."})
         validated_data["haste"] = services.clamp_trait(validated_data.get("haste", 0.5))
         validated_data["balls"] = services.clamp_trait(validated_data.get("balls", 0.5))
         validated_data["order_interval_seconds"] = services.derive_interval(
-            validated_data["haste"], control
+            validated_data["haste"], account
         )
         return super().create(validated_data)
 
@@ -72,8 +83,18 @@ class MonkeySerializer(serializers.ModelSerializer):
 
 
 class MonkeyBulkCreateSerializer(serializers.Serializer):
+    account = serializers.PrimaryKeyRelatedField(
+        queryset=Account.objects.filter(is_active=True)
+    )
     count = serializers.IntegerField(min_value=1, max_value=1000)
     starting_balance = serializers.IntegerField(min_value=0)
+
+    def validate_account(self, account):
+        if not account.is_mock:
+            raise serializers.ValidationError(
+                "원숭이는 모의투자 계좌에만 생성할 수 있습니다."
+            )
+        return account
 
     def create(self, validated_data):
         return services.create_monkeys_checked(**validated_data)
@@ -133,12 +154,44 @@ class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class AccountSerializer(serializers.ModelSerializer):
+    # App key/secret are write-only — never returned after registration.
+    app_key = serializers.CharField(write_only=True)
+    app_secret = serializers.CharField(write_only=True)
+    display_id = serializers.ReadOnlyField()
+    token_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Account
+        fields = [
+            "id",
+            "display_id",
+            "account_type",
+            "app_key",
+            "app_secret",
+            "account_number",
+            "product_code",
+            "is_active",
+            "token_status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["is_active", "created_at", "updated_at"]
+
+    def get_token_status(self, obj):
+        token = getattr(obj, "access_token", None)
+        return {
+            "has_token": token is not None,
+            "expires_at": token.expires_at if token else None,
+        }
+
+
 class KisAccessTokenSerializer(serializers.ModelSerializer):
     class Meta:
         model = KisAccessToken
         fields = [
             "id",
-            "environment",
+            "account",
             "expires_at",
             "created_at",
             "updated_at",
@@ -146,6 +199,9 @@ class KisAccessTokenSerializer(serializers.ModelSerializer):
 
 
 class AccountSummarySerializer(serializers.Serializer):
+    account_id = serializers.IntegerField()
+    display_id = serializers.CharField()
+    account_type = serializers.CharField()
     kis_cash_balance = serializers.IntegerField()
     kis_holdings_value = serializers.IntegerField()
     kis_total_assets = serializers.IntegerField()
@@ -173,16 +229,17 @@ class DashboardSummarySerializer(serializers.Serializer):
 
 
 def _orders_by_stock(monkey):
-    """Succeeded orders grouped by ``stock_id``, ascending by (created_at, id).
+    """Executed orders grouped by ``stock_id``, ascending by (created_at, id).
 
-    Reuses the ``_succeeded_orders`` prefetch (set by ``MonkeyViewSet.get_queryset``
-    for list/retrieve) when present so the metrics/breakdown helpers run no extra
-    queries; otherwise queries once for this monkey.
+    Only EXECUTED orders moved the local ledger, so the FIFO/holdings math walks
+    those (pending SUBMITTED orders haven't touched balance/Holding yet). Reuses
+    the ``_executed_orders`` prefetch (set by ``MonkeyViewSet.get_queryset`` for
+    list/retrieve) when present; otherwise queries once for this monkey.
     """
-    prefetched = getattr(monkey, "_succeeded_orders", None)
+    prefetched = getattr(monkey, "_executed_orders", None)
     if prefetched is None:
         prefetched = (
-            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUCCEEDED)
+            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.EXECUTED)
             .select_related("stock")
             .order_by("created_at", "id")
         )
@@ -190,6 +247,17 @@ def _orders_by_stock(monkey):
     for order in prefetched:
         grouped.setdefault(order.stock_id, []).append(order)
     return grouped
+
+
+def _pending_orders_for(monkey):
+    """Accepted-but-unfilled (SUBMITTED) orders, reusing the ``_pending_orders``
+    prefetch when present so the metrics helper runs no extra per-monkey query."""
+    prefetched = getattr(monkey, "_pending_orders", None)
+    if prefetched is None:
+        prefetched = list(
+            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUBMITTED)
+        )
+    return list(prefetched)
 
 
 def _holdings_for(monkey, only_positive):
@@ -229,8 +297,18 @@ def build_monkey_metrics(monkey):
     earning_ratio = (
         (total_pl / monkey.initial_balance) if monkey.initial_balance else 0.0
     )
+
+    # 주문가능금액: settled cash minus what pending (SUBMITTED) buy orders reserve.
+    pending = _pending_orders_for(monkey)
+    buy_reserve = sum(
+        (order.estimated_price or 0) * (order.requested_quantity or 0)
+        for order in pending
+        if order.order_type == Order.OrderTypeChoices.BUY
+    )
     return {
         "cash_balance": monkey.balance,
+        "available_cash": monkey.balance - buy_reserve,
+        "pending_orders": len(pending),
         "holdings_value": holdings_value,
         "total_equity": total_equity,
         "total_pl": total_pl,

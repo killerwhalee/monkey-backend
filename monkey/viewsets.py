@@ -5,7 +5,7 @@ from rest_framework.response import Response
 
 from market.models import Holding, Order
 from monkey import serializers, services
-from monkey.models import GlobalMonkeyControl, KisAccessToken, Monkey
+from monkey.models import Account, GlobalMonkeyControl, KisAccessToken, Monkey
 from monkey.task_catalog import TASK_CATALOG, TASK_MAP
 
 
@@ -16,10 +16,27 @@ class IsAdminOrReadOnly(permissions.BasePermission):
         return bool(request.user and request.user.is_staff)
 
 
+class AccountViewSet(viewsets.ModelViewSet):
+    """Register/list/remove KIS accounts. Admin-only — keys are sensitive.
+
+    DELETE soft-deletes (wipes keys, kills monkeys, drops holdings, keeps orders);
+    the row is retained so dead monkeys/orders still resolve.
+    """
+
+    queryset = Account.objects.all().order_by("id")
+    serializer_class = serializers.AccountSerializer
+    permission_classes = [permissions.IsAdminUser]
+    filterset_fields = ["account_type", "is_active"]
+
+    def perform_destroy(self, instance):
+        services.soft_delete_account(instance)
+
+
 class MonkeyViewSet(viewsets.ModelViewSet):
     queryset = Monkey.objects.all().order_by("id")
     serializer_class = serializers.MonkeySerializer
     permission_classes = [IsAdminOrReadOnly]
+    filterset_fields = ["account", "state", "is_system"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -28,10 +45,11 @@ class MonkeyViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not (user and user.is_staff):
             qs = qs.filter(is_system=False)
-        # Read paths serialize per-monkey metrics/holdings; prefetch holdings and
-        # succeeded orders once so the helpers run no per-monkey/per-stock queries.
-        # Excluded for mutating actions (e.g. force-kill) so the response reflects
-        # post-mutation state rather than a stale prefetch.
+        # Read paths serialize per-monkey metrics/holdings; prefetch holdings,
+        # executed orders (for FIFO) and pending orders (for 주문가능금액) once so
+        # the helpers run no per-monkey/per-stock queries. Excluded for mutating
+        # actions (e.g. force-kill) so the response reflects post-mutation state
+        # rather than a stale prefetch.
         if self.action in ("list", "retrieve", "summary"):
             qs = qs.prefetch_related(
                 Prefetch(
@@ -41,10 +59,15 @@ class MonkeyViewSet(viewsets.ModelViewSet):
                 ),
                 Prefetch(
                     "orders",
-                    queryset=Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+                    queryset=Order.objects.filter(status=Order.StatusChoices.EXECUTED)
                     .select_related("stock")
                     .order_by("created_at", "id"),
-                    to_attr="_succeeded_orders",
+                    to_attr="_executed_orders",
+                ),
+                Prefetch(
+                    "orders",
+                    queryset=Order.objects.filter(status=Order.StatusChoices.SUBMITTED),
+                    to_attr="_pending_orders",
                 ),
             )
         return qs
@@ -238,7 +261,7 @@ class GlobalMonkeyControlViewSet(viewsets.ModelViewSet):
 
 
 class KisAccessTokenViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = KisAccessToken.objects.all().order_by("environment")
+    queryset = KisAccessToken.objects.all().order_by("account_id")
     serializer_class = serializers.KisAccessTokenSerializer
     permission_classes = [permissions.IsAdminUser]
 
@@ -255,8 +278,16 @@ class AccountSummaryView(views.APIView):
     permission_classes = [permissions.IsAdminUser]
 
     def get(self, request):
-        data = services.build_account_summary()
-        return Response(serializers.AccountSummarySerializer(data).data)
+        # ?account=<id> for one account's snapshot; otherwise all active accounts.
+        account_id = request.query_params.get("account")
+        if account_id:
+            account = Account.objects.filter(pk=account_id, is_active=True).first()
+            if account is None:
+                return Response([], status=status.HTTP_404_NOT_FOUND)
+            data = [services.build_account_summary(account)]
+        else:
+            data = services.list_account_summaries()
+        return Response(serializers.AccountSummarySerializer(data, many=True).data)
 
 
 class IndexReturnsView(views.APIView):

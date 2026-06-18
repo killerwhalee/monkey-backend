@@ -45,20 +45,20 @@ def _get_redis():
     return _redis_client
 
 
-def kis_throttle(environment):
-    """Block until at least ``KIS_MIN_REQUEST_INTERVAL`` has passed since the last
-    KIS request (shared across all workers/processes via Redis).
+def kis_throttle(rate_limit_key, interval):
+    """Block until at least ``interval`` seconds have passed since the last KIS
+    request for ``rate_limit_key`` (shared across all workers/processes via Redis).
 
-    KIS paper trading caps requests at ~1/sec per account, so this is the single
-    chokepoint that keeps the whole fleet within budget. If Redis is unreachable
-    we proceed best-effort rather than block trading.
+    The limiter is keyed per account, so each account gets its own budget: mock
+    accounts ~1/sec each (so multiple mock accounts run in parallel), a real
+    account ~18/sec. If Redis is unreachable we proceed best-effort rather than
+    block trading.
     """
-    interval = getattr(settings, "KIS_MIN_REQUEST_INTERVAL", 0)
     if not interval:
         return
     try:
         client = _get_redis()
-        key = f"kis:ratelimit:{environment}"
+        key = f"kis:ratelimit:{rate_limit_key}"
         wait = float(
             client.eval(_RATE_LIMIT_LUA, 1, key, str(time.time()), str(interval))
         )
@@ -69,34 +69,37 @@ def kis_throttle(environment):
 
 
 class KisClient:
-    BUY_TR_ID = "VTTC0012U"
-    SELL_TR_ID = "VTTC0011U"
     PRICE_TR_ID = "FHKST01010100"
-    BALANCE_TR_ID = "VTTC8434R"
     HOLIDAY_TR_ID = "CTCA0903R"
-    DAILY_CCLD_TR_ID = "VTTC0081R"
 
     # Holdings pagination cap. Paper trading returns ~20 holdings per page, and a
-    # single shared account can hold close to the whole KRX universe (~2,900
-    # tickers) as monkeys buy widely — so the cap must clear that with headroom.
-    # It only guards against a malformed continuation loop; normal paging stops
-    # on the tr_cont flag well before this.
+    # single account can hold close to the whole KRX universe (~2,900 tickers) as
+    # monkeys buy widely — so the cap must clear that with headroom. It only guards
+    # against a malformed continuation loop; normal paging stops on the tr_cont
+    # flag well before this.
     MAX_BALANCE_PAGES = 500
 
     # The holiday endpoint is not served on the virtual/paper domain
     # (모의투자 미지원), so it is always queried against production.
     HOLIDAY_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
-    def __init__(self):
-        self.base_url = settings.KIS_API_BASE_URL.rstrip("/")
-        self.environment = settings.KIS_ENVIRONMENT
-        self.app_key = settings.KIS_APP_KEY
-        self.app_secret = settings.KIS_APP_SECRET
-        self.account_number = settings.KIS_CANO
-        self.account_product_code = settings.KIS_ACNT_PRDT_CD
+    def __init__(self, account):
+        """Bind the client to a single ``monkey.models.Account``.
+
+        All credentials, the base URL, tr_id codes, and the per-account rate-limit
+        budget come from the account row (app key/secret are decrypted on access).
+        """
+        self.account = account
+        self.base_url = account.base_url.rstrip("/")
+        self.rate_limit_key = account.rate_limit_key
+        self.rate_limit_interval = account.rate_limit_interval
+        self.app_key = account.app_key
+        self.app_secret = account.app_secret
+        self.account_number = account.account_number
+        self.account_product_code = account.product_code
 
     def get_access_token(self):
-        token = KisAccessToken.objects.filter(environment=self.environment).first()
+        token = KisAccessToken.objects.filter(account=self.account).first()
         refresh_at = timezone.now() + timedelta(
             seconds=settings.KIS_TOKEN_REFRESH_MARGIN_SECONDS
         )
@@ -122,7 +125,7 @@ class KisClient:
 
         expires_at = self._parse_token_expiry(data)
         obj, _ = KisAccessToken.objects.update_or_create(
-            environment=self.environment,
+            account=self.account,
             defaults={
                 "token": token,
                 "expires_at": expires_at,
@@ -173,7 +176,10 @@ class KisClient:
             response = self._execute(
                 "GET",
                 f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
-                headers={**self._headers(self.BALANCE_TR_ID), "tr_cont": tr_cont},
+                headers={
+                    **self._headers(self.account.balance_tr_id),
+                    "tr_cont": tr_cont,
+                },
                 params={
                     "CANO": self.account_number,
                     "ACNT_PRDT_CD": self.account_product_code,
@@ -248,12 +254,15 @@ class KisClient:
         return False
 
     def get_daily_order_executions(self, start_date=None, end_date=None):
-        """Return executed quantity/avg price per KIS order number (ODNO).
+        """Return executed quantity/avg price/total amount per KIS order number.
 
         Walks the 주식일별주문체결조회 endpoint (paginating with the continuation
-        keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int}}``
-        for orders with at least one fill. ODNO keys are stripped of leading
-        zeros so they match however the order was originally recorded.
+        keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int,
+        "executed_amount": int}}`` for orders with at least one fill. ODNO keys
+        are stripped of leading zeros so they match however the order was
+        originally recorded. ``executed_amount`` is KIS's own 총체결금액
+        (``tot_ccld_amt``) — the exact won the trade moved — so the ledger debits
+        the real cash rather than a rounded ``qty × avg_price``.
         """
         today = timezone.localdate()
         start = (start_date or today).strftime("%Y%m%d")
@@ -267,7 +276,10 @@ class KisClient:
             response = self._execute(
                 "GET",
                 f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
-                headers={**self._headers(self.DAILY_CCLD_TR_ID), "tr_cont": tr_cont},
+                headers={
+                    **self._headers(self.account.daily_ccld_tr_id),
+                    "tr_cont": tr_cont,
+                },
                 params={
                     "CANO": self.account_number,
                     "ACNT_PRDT_CD": self.account_product_code,
@@ -292,9 +304,15 @@ class KisClient:
                 executed = int(item.get("tot_ccld_qty") or 0)
                 if not odno or executed <= 0:
                     continue
+                avg_price = round(float(item.get("avg_prvs") or 0))
+                # Prefer KIS's own total executed amount; fall back to qty × avg.
+                executed_amount = int(float(item.get("tot_ccld_amt") or 0)) or (
+                    executed * avg_price
+                )
                 executions[odno] = {
                     "executed_quantity": executed,
-                    "avg_price": round(float(item.get("avg_prvs") or 0)),
+                    "avg_price": avg_price,
+                    "executed_amount": executed_amount,
                 }
 
             tr_cont = response.headers.get("tr_cont", "")
@@ -308,9 +326,9 @@ class KisClient:
     def order_stock(self, order_type, ticker, quantity):
         from market.models import Order
 
-        tr_id = self.BUY_TR_ID
+        tr_id = self.account.buy_tr_id
         if order_type == Order.OrderTypeChoices.SELL:
-            tr_id = self.SELL_TR_ID
+            tr_id = self.account.sell_tr_id
 
         payload = {
             "CANO": self.account_number,
@@ -368,7 +386,7 @@ class KisClient:
         attempts = max(1, getattr(settings, "KIS_MAX_RETRIES", 0) + 1)
         last_error = None
         for attempt in range(attempts):
-            kis_throttle(self.environment)
+            kis_throttle(self.rate_limit_key, self.rate_limit_interval)
             try:
                 response = send(url, **kwargs)
             except (requests.ConnectionError, requests.Timeout) as exc:

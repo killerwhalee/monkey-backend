@@ -1,8 +1,110 @@
 import json
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import OperationalError, ProgrammingError, models
+
+from monkey.fields import EncryptedTextField
+
+
+class Account(models.Model):
+    """A KIS trading account whose credentials are stored encrypted at rest.
+
+    Two types exist:
+    - MOCK (모의투자): paper trading; the only type monkeys may be bound to.
+    - REAL (실전투자): registered only to lend its higher rate limit (~18 req/s)
+      to account-free tasks (price polling, holiday check). Monkeys never trade
+      on a real account, so no real money is ever at risk.
+
+    An account is identified by its CANO + product code (e.g. ``5033-3044-01``),
+    not a free-text label. The app key/secret are write-only over the API and
+    never returned after registration.
+    """
+
+    class AccountType(models.TextChoices):
+        MOCK = "mock", "모의투자"
+        REAL = "real", "실전투자"
+
+    account_type = models.CharField(
+        "Account type",
+        max_length=8,
+        choices=AccountType.choices,
+        default=AccountType.MOCK,
+    )
+    app_key = EncryptedTextField("App key")
+    app_secret = EncryptedTextField("App secret")
+    account_number = models.CharField(
+        "Account number (CANO)",
+        max_length=16,
+        help_text="8-digit KIS account number, no hyphens.",
+    )
+    product_code = models.CharField(
+        "Account product code",
+        max_length=4,
+        default="01",
+    )
+    is_active = models.BooleanField(
+        "Is active?",
+        default=True,
+        help_text="Soft-delete flag; inactive accounts keep their history but no longer trade.",
+    )
+    created_at = models.DateTimeField("Created at", auto_now_add=True)
+    updated_at = models.DateTimeField("Updated at", auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["account_number", "product_code"],
+                name="unique_account_cano_product",
+            ),
+        ]
+
+    @property
+    def display_id(self) -> str:
+        """Human-facing identifier: CANO split 4-4 plus the product code."""
+        cano = (self.account_number or "").zfill(8)
+        return f"{cano[:4]}-{cano[4:8]}-{self.product_code}"
+
+    @property
+    def is_mock(self) -> bool:
+        return self.account_type == self.AccountType.MOCK
+
+    @property
+    def base_url(self) -> str:
+        if self.is_mock:
+            return "https://openapivts.koreainvestment.com:29443"
+        return "https://openapi.koreainvestment.com:9443"
+
+    @property
+    def rate_limit_key(self) -> str:
+        return f"account:{self.pk}"
+
+    @property
+    def rate_limit_interval(self) -> float:
+        if self.is_mock:
+            return settings.KIS_MOCK_REQUEST_INTERVAL
+        return settings.KIS_REAL_REQUEST_INTERVAL
+
+    # KIS tr_id codes differ between mock (V…) and real (T…) trading.
+    @property
+    def buy_tr_id(self) -> str:
+        return "VTTC0012U" if self.is_mock else "TTTC0012U"
+
+    @property
+    def sell_tr_id(self) -> str:
+        return "VTTC0011U" if self.is_mock else "TTTC0011U"
+
+    @property
+    def balance_tr_id(self) -> str:
+        return "VTTC8434R" if self.is_mock else "TTTC8434R"
+
+    @property
+    def daily_ccld_tr_id(self) -> str:
+        return "VTTC0081R" if self.is_mock else "TTTC8001R"
+
+    def __str__(self):
+        return f"[{self.__class__.__name__} #{self.pk:04d}] {self.display_id} ({self.account_type})"
 
 
 class GlobalMonkeyControl(models.Model):
@@ -104,12 +206,13 @@ class GlobalMonkeyControl(models.Model):
 
 
 class KisAccessToken(models.Model):
-    """Shared KIS API token for Celery workers."""
+    """KIS OAuth token for one account, shared across Celery workers."""
 
-    environment = models.CharField(
-        "Environment",
-        max_length=32,
-        unique=True,
+    account = models.OneToOneField(
+        "monkey.Account",
+        verbose_name="account",
+        on_delete=models.CASCADE,
+        related_name="access_token",
     )
     token = models.TextField(
         "Access token",
@@ -129,23 +232,24 @@ class KisAccessToken(models.Model):
     def __str__(self):
         return (
             f"[{self.__class__.__name__} #{self.pk:04d}] "
-            f"{self.environment} expires_at={self.expires_at}"
+            f"account={self.account_id} expires_at={self.expires_at}"
         )
 
 
 class KisAccountCache(models.Model):
-    """Cached KIS account balance, keyed by environment (like KisAccessToken).
+    """Cached KIS account balance for one account.
 
-    A live KIS balance inquiry is throttled to ~1 req/sec, so the admin
-    "내 자산 현황" card would stall fetching it on every request. Instead the
-    market-hours poll (``services.update_held_stock_prices``) refreshes this row
-    and ``build_account_summary`` serves it without touching KIS.
+    A live KIS balance inquiry is throttled, so the admin "내 자산 현황" card would
+    stall fetching it on every request. Instead the market-hours poll
+    (``services.refresh_account_cache``) refreshes this row per account and
+    ``build_account_summary`` serves it without touching KIS.
     """
 
-    environment = models.CharField(
-        "Environment",
-        max_length=32,
-        unique=True,
+    account = models.OneToOneField(
+        "monkey.Account",
+        verbose_name="account",
+        on_delete=models.CASCADE,
+        related_name="balance_cache",
     )
     cash_balance = models.IntegerField("Cash balance")
     securities_value = models.IntegerField("Securities value")
@@ -160,7 +264,7 @@ class KisAccountCache(models.Model):
     def __str__(self):
         return (
             f"[{self.__class__.__name__} #{self.pk:04d}] "
-            f"{self.environment} total_assets={self.total_assets}"
+            f"account={self.account_id} total_assets={self.total_assets}"
         )
 
 
@@ -170,6 +274,15 @@ class Monkey(models.Model):
         INACTIVE = "inactive", "Inactive"  # alive but paused (schedule disabled)
         DEAD = "dead", "Dead"  # killed permanently; never revives
 
+    account = models.ForeignKey(
+        "monkey.Account",
+        verbose_name="account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="monkeys",
+        help_text="The KIS account this monkey trades on (mock only). Null once orphaned.",
+    )
     name = models.CharField(
         "Name",
         max_length=32,
@@ -222,6 +335,16 @@ class Monkey(models.Model):
         "Created at",
         auto_now_add=True,
     )
+
+    class Meta:
+        constraints = [
+            # At most one system monkey per account (reconciliation is per-account).
+            models.UniqueConstraint(
+                fields=["account"],
+                condition=models.Q(is_system=True, account__isnull=False),
+                name="unique_system_monkey_per_account",
+            ),
+        ]
 
     @property
     def is_active(self) -> bool:

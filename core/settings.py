@@ -47,6 +47,9 @@ CORS_ALLOW_CREDENTIALS = env.bool(
 # Application definition
 
 INSTALLED_APPS = [
+    # daphne must come first so it owns the runserver command (ASGI dev server)
+    "daphne",
+    "channels",
     # vendor apps
     "rest_framework",
     "django_filters",
@@ -99,6 +102,7 @@ CELERY_TASK_ROUTES = {
     "monkey.tasks.get_stock_price": {"queue": "kis_orders"},
     # market-open, low traffic but important
     "monkey.tasks.update_held_stock_prices": {"queue": "kis_maintenance"},
+    "monkey.tasks.finalize_filled_orders": {"queue": "kis_maintenance"},
     # runs while the market is closed
     "monkey.tasks.reconcile_executions": {"queue": "kis_offhours"},
     "monkey.tasks.update_token": {"queue": "kis_offhours"},
@@ -112,8 +116,13 @@ CELERY_TASK_ROUTES = {
 
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
-# Minimum spacing between any two KIS HTTP requests (paper trading: ~1/sec).
-KIS_MIN_REQUEST_INTERVAL = env.float("KIS_MIN_REQUEST_INTERVAL", default=1.1)
+# Minimum spacing between any two KIS HTTP requests, per account. Paper/mock
+# trading caps at ~1/sec; real trading allows ~18/sec (used for account-free
+# tasks like price polling). The limiter is keyed per account, so each account
+# gets its own budget (see monkey.kis.kis_throttle / Account.rate_limit_interval).
+KIS_MOCK_REQUEST_INTERVAL = env.float("KIS_MOCK_REQUEST_INTERVAL", default=1.1)
+
+KIS_REAL_REQUEST_INTERVAL = env.float("KIS_REAL_REQUEST_INTERVAL", default=1.0 / 18)
 
 # How many times to retry a transient KIS failure (5xx / timeout / rate-limit).
 KIS_MAX_RETRIES = env.int("KIS_MAX_RETRIES", default=3)
@@ -123,7 +132,8 @@ KIS_REQUEST_TIMEOUT = (5, 15)
 
 # Don't throttle/sleep during the test suite.
 if "test" in sys.argv:
-    KIS_MIN_REQUEST_INTERVAL = 0
+    KIS_MOCK_REQUEST_INTERVAL = 0
+    KIS_REAL_REQUEST_INTERVAL = 0
 
 
 # Middleware
@@ -157,6 +167,28 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "core.wsgi.application"
+
+ASGI_APPLICATION = "core.asgi.application"
+
+
+# Channels — live WebSocket layer. Uses Redis (a separate db index from the
+# Celery broker at db 0 to avoid key collisions). Tests use an in-memory layer.
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [
+                env("CHANNEL_LAYERS_REDIS_URL", default="redis://127.0.0.1:6379/2")
+            ],
+        },
+    },
+}
+
+if "test" in sys.argv:
+    CHANNEL_LAYERS = {
+        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+    }
 
 
 # Database
@@ -276,27 +308,22 @@ STATIC_ROOT = BASE_DIR / "_static"
 
 
 # KIS Open API
+#
+# Credentials (app key/secret/CANO) are no longer read from the environment —
+# they live encrypted in the database (monkey.models.Account) and are registered
+# via the manage UI. Only the cross-account knobs remain here.
 
-KIS_APP_KEY = env("KIS_APP_KEY", default="")
+# Fernet key used by monkey.fields.EncryptedTextField to encrypt KIS app
+# key/secret at rest. Generate with `Fernet.generate_key()` and back it up
+# securely — losing it makes every stored credential unrecoverable.
+FIELD_ENCRYPTION_KEY = env("FIELD_ENCRYPTION_KEY", default="")
 
-KIS_APP_SECRET = env("KIS_APP_SECRET", default="")
+# Tests don't load a real .env, so supply a throwaway Fernet key so the
+# EncryptedTextField round-trips. Never used outside the test suite.
+if "test" in sys.argv and not FIELD_ENCRYPTION_KEY:
+    from cryptography.fernet import Fernet
 
-KIS_CANO = env("KIS_CANO", default="")
-
-KIS_API_BASE_URL = env(
-    "KIS_API_BASE_URL",
-    default="https://openapivts.koreainvestment.com:29443",
-)
-
-KIS_ENVIRONMENT = env(
-    "KIS_ENVIRONMENT",
-    default="virtual",
-)
-
-KIS_ACNT_PRDT_CD = env(
-    "KIS_ACNT_PRDT_CD",
-    default="01",
-)
+    FIELD_ENCRYPTION_KEY = Fernet.generate_key().decode()
 
 KIS_TOKEN_REFRESH_MARGIN_SECONDS = env.int(
     "KIS_TOKEN_REFRESH_MARGIN_SECONDS",
