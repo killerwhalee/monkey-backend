@@ -99,5 +99,12 @@ def update_all_stock_prices():
 
 
 @shared_task
+def finalize_filled_orders():
+    if not services.get_global_control().market_open:
+        return {"market_open": False}
+    return services.finalize_filled_orders()
+
+
+@shared_task
 def reconcile_executions():
     return services.reconcile_order_executions()

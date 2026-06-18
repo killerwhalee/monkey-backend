@@ -99,6 +99,7 @@ CELERY_TASK_ROUTES = {
     "monkey.tasks.get_stock_price": {"queue": "kis_orders"},
     # market-open, low traffic but important
     "monkey.tasks.update_held_stock_prices": {"queue": "kis_maintenance"},
+    "monkey.tasks.finalize_filled_orders": {"queue": "kis_maintenance"},
     # runs while the market is closed
     "monkey.tasks.reconcile_executions": {"queue": "kis_offhours"},
     "monkey.tasks.update_token": {"queue": "kis_offhours"},
