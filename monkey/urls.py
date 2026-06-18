@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from monkey import viewsets
 
 router = DefaultRouter()
+router.register("accounts", viewsets.AccountViewSet, basename="account")
 router.register("monkeys", viewsets.MonkeyViewSet, basename="monkey")
 router.register(
     "global-monkey-control",
