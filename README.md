@@ -84,13 +84,20 @@ Populate it with the following keys:
 | `DJANGO_ALLOWED_HOSTS` | no | `127.0.0.1,localhost` | Comma-separated list |
 | `CORS_ALLOWED_ORIGINS` | no | `http://localhost:5173` | Comma-separated list; should include the frontend dev/prod origin |
 | `CORS_ALLOW_CREDENTIALS` | no | `True` | |
-| `KIS_APP_KEY` | yes (for trading) | `""` | KIS Open API app key |
-| `KIS_APP_SECRET` | yes (for trading) | `""` | KIS Open API app secret |
-| `KIS_CANO` | yes (for trading) | `""` | KIS account number (8-digit prefix, no hyphens) |
-| `KIS_API_BASE_URL` | no | `https://openapivts.koreainvestment.com:29443` | Default points to the **virtual/paper-trading** API |
-| `KIS_ENVIRONMENT` | no | `virtual` | Used as the key for the cached `KisAccessToken` row |
-| `KIS_ACNT_PRDT_CD` | no | `01` | KIS account product code (last 2 digits of account number) |
+| `FIELD_ENCRYPTION_KEY` | **yes** | `""` | Fernet key encrypting KIS app key/secret at rest (see below). Back it up — losing it makes stored credentials unrecoverable. |
+| `CHANNEL_LAYERS_REDIS_URL` | no | `redis://127.0.0.1:6379/2` | Redis URL for the Channels (WebSocket) layer; use a different db index than the Celery broker. |
+| `KIS_MOCK_REQUEST_INTERVAL` | no | `1.1` | Min seconds between KIS requests for a mock account (~1/sec). |
+| `KIS_REAL_REQUEST_INTERVAL` | no | `0.056` | Min seconds between KIS requests for a real account (~18/sec). |
 | `KIS_TOKEN_REFRESH_MARGIN_SECONDS` | no | `300` | Refresh the KIS token this many seconds before it expires |
+
+> **KIS credentials are no longer environment variables.** App key/secret/account
+> number now live encrypted in the database (`monkey.models.Account`) and are
+> registered through the manage UI (관리자 → 계좌). Generate the Fernet encryption
+> key once with:
+>
+> ```bash
+> uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+> ```
 
 Generate a secret key:
 
@@ -107,14 +114,13 @@ DJANGO_DATABASE=sqlite:///db.sqlite3
 DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost
 CORS_ALLOWED_ORIGINS=http://localhost:5173
 
-KIS_APP_KEY=<your-kis-app-key>
-KIS_APP_SECRET=<your-kis-app-secret>
-KIS_CANO=<your-kis-virtual-account-number>
+FIELD_ENCRYPTION_KEY=<generated-fernet-key>
 ```
 
 KIS Open API credentials and a virtual-trading account are obtained from
 https://apiportal.koreainvestment.com — issue an app key/secret pair and enable the
-virtual/paper-trading account for the issued app.
+virtual/paper-trading account for the issued app, then register them in the manage
+UI (관리자 → 계좌) rather than the `.env` file.
 
 To use Postgres or another database instead of SQLite, set `DJANGO_DATABASE` to a URL such as
 `postgres://user:password@127.0.0.1:5432/monkey` and ensure the corresponding driver is installed.
@@ -168,30 +174,31 @@ Watch the worker log for completion. This downloads and parses the KRX KOSPI/KOS
 files and upserts every listed stock into the `Stock` table. Re-run periodically (e.g. via a
 Django-admin-managed periodic task) to pick up newly listed/delisted tickers.
 
-### 8.2 KIS access token
+### 8.2 Register a KIS account
 
-The KIS API requires an OAuth token, cached in the `KisAccessToken` table and shared across Celery
-workers. It is fetched lazily the first time `KisClient` is used, but you can fetch it eagerly to
-verify your `KIS_APP_KEY`/`KIS_APP_SECRET`/`KIS_CANO` credentials are correct:
+KIS credentials live encrypted in the database, one row per `monkey.models.Account`. Register a
+mock (paper-trading) account through the manage UI (관리자 → 계좌) by entering the account type, app
+key, app secret, account number (CANO), and product code. The keys are encrypted with
+`FIELD_ENCRYPTION_KEY` and never shown again after registration.
+
+The OAuth token is cached per account in the `KisAccessToken` table and fetched lazily the first
+time that account's `KisClient` is used; you can fetch all accounts' tokens eagerly to verify the
+credentials:
 
 ```bash
 uv run python manage.py shell -c "from monkey.tasks import update_token; update_token.delay()"
 ```
 
-Check `KisAccessToken` in the Django admin (`/admin/monkey/kisaccesstoken/`) to confirm a token
-was saved.
+A **real** account can also be registered — it never hosts monkeys, but account-free tasks (price
+polling, holiday check) borrow it for its higher rate limit (~18 req/s).
 
 ### 8.3 Global trading switch
 
-`GlobalMonkeyControl` is a singleton (`pk=1`) that gates *all* automatic trading. It is created
-automatically (with `enabled=False`) the first time it's accessed — e.g. on the first API request
-to `/api/global-monkey-control/current/`, or the first scheduled task run. No manual step is
-required, but trading stays **off** until you (or the `market.auto.open` schedule, on weekday
-mornings) enable it via the admin or the API.
-
-You can also tune `kill_threshold` (earning ratio below which a monkey is auto-deactivated) and
-`order_interval_seconds` (how often each monkey trades) on this singleton via
-`/admin/monkey/globalmonkeycontrol/`.
+`GlobalMonkeyControl` is a singleton (`pk=1`) that gates *all* automatic trading via three gates
+(time / holiday / manual). It is created automatically the first time it's accessed. Trading stays
+**off** until the `market.auto.open` schedule (or an admin) opens the time gate. Per-account
+auto-create config (starting balance, order-interval range) is edited per account in the manage UI
+(관리자 → 계좌).
 
 ### 8.4 Create monkeys
 
@@ -214,6 +221,11 @@ uv run celery -A core worker -l info
 
 # Celery beat — triggers scheduled tasks (per-monkey trading, market open/close, daily snapshot)
 uv run celery -A core beat -l info
+
+# Daphne — ASGI/WebSocket server for live dashboard/admin updates (Channels).
+# In dev, `runserver` (now the Channels dev server) also serves /ws; run daphne
+# explicitly only to mirror the production split (gunicorn for HTTP, daphne for /ws).
+uv run daphne -b 127.0.0.1 -p 8001 core.asgi:application
 ```
 
 All three depend on Redis being up (`CELERY_BROKER_URL`, defaulting to `redis://127.0.0.1:6379/0`
