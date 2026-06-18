@@ -28,7 +28,7 @@ def remove_schedule(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("monkey", "0027_wipe_index_history"),
+        ("monkey", "0029_discard_orphans"),
     ]
 
     operations = [

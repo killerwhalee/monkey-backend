@@ -23,6 +23,13 @@ jobs:
             git checkout main
             git pull --ff-only origin main
             uv sync --frozen
+            # Back up the DB before migrating — the multi-account rollout includes an
+            # irreversible discard-orphans data migration (0029). Production runs
+            # PostgreSQL (see deploy/README.md), so dump with pg_dump rather than copying
+            # the sqlite file. `set -e` aborts the deploy if the backup fails, so the
+            # irreversible migration never runs unprotected.
+            DB_URL="$(grep -E '^DJANGO_DATABASE=' .env | head -n1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
+            pg_dump --no-owner "$DB_URL" > "$HOME/monkey-db.bak.$(date +%F-%H%M%S).sql"
             uv run python manage.py migrate --noinput
             uv run python manage.py collectstatic --noinput
             sudo systemctl restart monkey.target

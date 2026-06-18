@@ -5,7 +5,7 @@ from rest_framework.response import Response
 
 from market.models import Holding, Order
 from monkey import serializers, services
-from monkey.models import GlobalMonkeyControl, KisAccessToken, Monkey
+from monkey.models import Account, GlobalMonkeyControl, KisAccessToken, Monkey
 from monkey.task_catalog import TASK_CATALOG, TASK_MAP
 
 
@@ -16,10 +16,27 @@ class IsAdminOrReadOnly(permissions.BasePermission):
         return bool(request.user and request.user.is_staff)
 
 
+class AccountViewSet(viewsets.ModelViewSet):
+    """Register/list/remove KIS accounts. Admin-only — keys are sensitive.
+
+    DELETE soft-deletes (wipes keys, kills monkeys, drops holdings, keeps orders);
+    the row is retained so dead monkeys/orders still resolve.
+    """
+
+    queryset = Account.objects.all().order_by("id")
+    serializer_class = serializers.AccountSerializer
+    permission_classes = [permissions.IsAdminUser]
+    filterset_fields = ["account_type", "is_active"]
+
+    def perform_destroy(self, instance):
+        services.soft_delete_account(instance)
+
+
 class MonkeyViewSet(viewsets.ModelViewSet):
     queryset = Monkey.objects.all().order_by("id")
     serializer_class = serializers.MonkeySerializer
     permission_classes = [IsAdminOrReadOnly]
+    filterset_fields = ["account", "state", "is_system"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -244,7 +261,7 @@ class GlobalMonkeyControlViewSet(viewsets.ModelViewSet):
 
 
 class KisAccessTokenViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = KisAccessToken.objects.all().order_by("environment")
+    queryset = KisAccessToken.objects.all().order_by("account_id")
     serializer_class = serializers.KisAccessTokenSerializer
     permission_classes = [permissions.IsAdminUser]
 
@@ -261,8 +278,16 @@ class AccountSummaryView(views.APIView):
     permission_classes = [permissions.IsAdminUser]
 
     def get(self, request):
-        data = services.build_account_summary()
-        return Response(serializers.AccountSummarySerializer(data).data)
+        # ?account=<id> for one account's snapshot; otherwise all active accounts.
+        account_id = request.query_params.get("account")
+        if account_id:
+            account = Account.objects.filter(pk=account_id, is_active=True).first()
+            if account is None:
+                return Response([], status=status.HTTP_404_NOT_FOUND)
+            data = [services.build_account_summary(account)]
+        else:
+            data = services.list_account_summaries()
+        return Response(serializers.AccountSummarySerializer(data, many=True).data)
 
 
 class IndexReturnsView(views.APIView):

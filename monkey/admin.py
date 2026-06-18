@@ -3,6 +3,20 @@ from django.contrib import admin
 from . import models
 
 
+@admin.register(models.Account)
+class AccountAdmin(admin.ModelAdmin):
+    list_display = [
+        "display_id",
+        "account_type",
+        "is_active",
+        "updated_at",
+    ]
+    list_filter = ["account_type", "is_active"]
+    # Never surface the encrypted secrets in the admin.
+    exclude = ["app_key", "app_secret"]
+    readonly_fields = ["created_at", "updated_at"]
+
+
 @admin.register(models.Monkey)
 class MonkeyAdmin(admin.ModelAdmin):
     list_display = [
@@ -40,7 +54,7 @@ class GlobalMonkeyControlAdmin(admin.ModelAdmin):
 
 @admin.register(models.KisAccessToken)
 class KisAccessTokenAdmin(admin.ModelAdmin):
-    list_display = ["environment", "expires_at", "updated_at"]
+    list_display = ["account", "expires_at", "updated_at"]
     readonly_fields = ["created_at", "updated_at"]
 
 
