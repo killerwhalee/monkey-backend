@@ -56,6 +56,7 @@ class FakeKisClient:
         self.earning_rate = earning_rate
         self.environment = environment
         self.balance_calls = 0
+        self._odno_seq = 0
 
     def get_stock_price(self, ticker):
         return self.price
@@ -78,18 +79,49 @@ class FakeKisClient:
         return self.executions
 
     def order_stock(self, order_type, ticker, quantity):
+        self._odno_seq += 1
+        odno = str(10000 + self._odno_seq)
         self.orders.append(
             {
                 "order_type": order_type,
                 "ticker": ticker,
                 "quantity": quantity,
+                "odno": odno,
             }
         )
         if self.fail_order:
             from monkey.kis import KisClientError
 
             raise KisClientError("network failed")
-        return {"PDNO": ticker, "ORD_QTY": str(quantity)}, self.response
+        # Give every accepted order a distinct ODNO so a later finalize can match
+        # fills per order (unless the canned response pins its own output/rt_cd).
+        response = dict(self.response)
+        if str(response.get("rt_cd")) == "0":
+            response["output"] = {**response.get("output", {}), "ODNO": odno}
+        return {"PDNO": ticker, "ORD_QTY": str(quantity)}, response
+
+    def fill(self, order, *, quantity=None, avg_price=None, amount=None):
+        """Register a KIS fill for an accepted (SUBMITTED) order, so a subsequent
+        finalize moves it to EXECUTED. Defaults to a full fill at the estimated
+        price. Returns ``self`` for chaining."""
+        order.refresh_from_db()
+        qty = order.requested_quantity if quantity is None else quantity
+        price = order.estimated_price if avg_price is None else avg_price
+        self.executions[order.kis_order_id.lstrip("0")] = {
+            "executed_quantity": qty,
+            "avg_price": price or 0,
+            "executed_amount": (qty * (price or 0)) if amount is None else amount,
+        }
+        return self
+
+
+def execute_order(client, order, *, quantity=None, avg_price=None, amount=None):
+    """Test helper: fill ``order`` on ``client`` and finalize it (SUBMITTED →
+    EXECUTED), returning the refreshed order."""
+    client.fill(order, quantity=quantity, avg_price=avg_price, amount=amount)
+    services.finalize_filled_orders(kis_client=client)
+    order.refresh_from_db()
+    return order
 
 
 class FakeResponse:
@@ -188,9 +220,19 @@ class MonkeyServiceTests(TestCase):
             kis_client=client,
         )
 
+        # Acceptance alone doesn't move the ledger — only the order is recorded.
+        monkey.refresh_from_db()
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        self.assertEqual(monkey.balance, 5000)
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
+        # 주문가능금액 already reflects the reserved cost.
+        self.assertEqual(services.available_cash(monkey), 2000)
+
+        # The fill applies the ledger with KIS's real numbers.
+        execute_order(client, order)
         monkey.refresh_from_db()
         holding = Holding.objects.get(monkey=monkey, stock=self.stock)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(monkey.balance, 2000)
         self.assertEqual(holding.quantity, 3)
         self.assertEqual(order.executed_price, 1000)
@@ -268,14 +310,17 @@ class MonkeyServiceTests(TestCase):
             def choice(self, values):
                 return Order.OrderTypeChoices.BUY
 
+        client = FakeKisClient(price=100)
         order = services.run_random_monkey_order(
             monkey.id,
-            kis_client=FakeKisClient(price=100),
+            kis_client=client,
             rng=Rng(),
         )
 
         self.assertEqual(order.requested_quantity, 20)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        execute_order(client, order)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         monkey.refresh_from_db()
         self.assertEqual(monkey.balance, 3000)
 
@@ -318,16 +363,23 @@ class MonkeyServiceTests(TestCase):
             def choice(self, values):
                 return Order.OrderTypeChoices.SELL
 
+        client = FakeKisClient(price=100)
         order = services.run_random_monkey_order(
             monkey.id,
-            kis_client=FakeKisClient(price=100),
+            kis_client=client,
             rng=Rng(),
         )
 
         self.assertEqual(order.stock_id, self.stock.id)
         self.assertNotEqual(order.stock_id, other_stock.id)
         self.assertEqual(order.requested_quantity, 9)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        # Holding only drops once the sell fill is applied.
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 21
+        )
+        execute_order(client, order)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(
             Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 12
         )
@@ -343,14 +395,17 @@ class MonkeyServiceTests(TestCase):
             def choice(self, values):
                 return Order.OrderTypeChoices.SELL
 
+        client = FakeKisClient(price=100)
         order = services.run_random_monkey_order(
             monkey.id,
-            kis_client=FakeKisClient(price=100),
+            kis_client=client,
             rng=Rng(),
         )
 
         self.assertEqual(order.requested_quantity, 1)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        execute_order(client, order)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertFalse(
             Holding.objects.filter(monkey=monkey, stock=self.stock).exists()
         )
@@ -499,7 +554,7 @@ class OrphanedHoldingsTests(TestCase):
             monkey=monkey,
             stock=self.stock,
             order_type=order_type,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
             requested_quantity=quantity,
             executed_quantity=quantity,
             estimated_price=100,
@@ -668,7 +723,7 @@ class OrphanedHoldingsTests(TestCase):
             stock=self.stock,
             order_type=Order.OrderTypeChoices.BUY,
             requested_quantity=1,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
         )
 
         # A fresh monkey (created today) is spared by the grace period.
@@ -707,7 +762,9 @@ class OrphanedHoldingsTests(TestCase):
         order = services.run_system_monkey_order(kis_client=fake_client)
 
         self.assertEqual(order.order_type, Order.OrderTypeChoices.SELL)
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        execute_order(fake_client, order)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(order.executed_quantity, 4)
         self.assertFalse(
             Holding.objects.filter(monkey=system_monkey, stock=self.stock).exists()
@@ -1148,7 +1205,7 @@ class MonkeyDailySnapshotTests(TestCase):
             monkey=monkey_b,
             stock=self.stock,
             order_type=Order.OrderTypeChoices.BUY,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
             requested_quantity=2,
             executed_quantity=2,
             estimated_price=1000,
@@ -1181,7 +1238,7 @@ class MonkeyDailySnapshotTests(TestCase):
             monkey=monkey,
             stock=self.stock,
             order_type=Order.OrderTypeChoices.BUY,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
             requested_quantity=1,
             executed_quantity=1,
             estimated_price=1000,
@@ -1233,7 +1290,7 @@ class DashboardSummaryApiTests(APITestCase):
                 monkey=active_monkey,
                 stock=self.stock,
                 order_type=Order.OrderTypeChoices.BUY,
-                status=Order.StatusChoices.SUCCEEDED,
+                status=Order.StatusChoices.EXECUTED,
                 requested_quantity=1,
                 executed_quantity=1,
                 estimated_price=1000,
@@ -1275,13 +1332,13 @@ class DashboardSummaryApiTests(APITestCase):
         self.assertAlmostEqual(response.data["monkey_index_change"], 0.05)
 
         latest_orders = response.data["latest_orders"]
-        # Up to 10 succeeded orders, newest first; the failed order is excluded.
+        # Up to 10 executed orders, newest first; the failed order is excluded.
         self.assertEqual(len(latest_orders), 7)
-        self.assertTrue(all(order["status"] == "succeeded" for order in latest_orders))
+        self.assertTrue(all(order["status"] == "executed" for order in latest_orders))
         self.assertEqual(
             [order["id"] for order in latest_orders],
             list(
-                Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+                Order.objects.filter(status=Order.StatusChoices.EXECUTED)
                 .order_by("-created_at")
                 .values_list("id", flat=True)[:10]
             ),
@@ -1410,7 +1467,7 @@ class HoldingsBreakdownTests(TestCase):
             monkey=self.monkey,
             stock=self.stock,
             order_type=Order.OrderTypeChoices.BUY,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
             requested_quantity=quantity,
             executed_quantity=quantity,
             estimated_price=price,
@@ -1446,7 +1503,7 @@ class HoldingsBreakdownTests(TestCase):
             monkey=self.monkey,
             stock=self.stock,
             order_type=Order.OrderTypeChoices.SELL,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.EXECUTED,
             requested_quantity=1,
             executed_quantity=1,
             estimated_price=1500,
@@ -1507,31 +1564,124 @@ class ExecutionReconciliationTests(TestCase):
         )
         services.set_trading_enabled(True)
 
-    def test_reconcile_corrects_executed_price_and_quantity(self):
-        # Reconciliation is a market-closed task; setUp opened the gate.
+    def test_after_close_finalize_applies_real_fill(self):
+        # After close, a pending order is committed with KIS's actual numbers.
         services.set_trading_enabled(False)
         order = Order.objects.create(
             monkey=self.monkey,
             stock=self.stock,
             order_type=Order.OrderTypeChoices.BUY,
-            status=Order.StatusChoices.SUCCEEDED,
+            status=Order.StatusChoices.SUBMITTED,
             requested_quantity=1,
-            executed_quantity=1,
             estimated_price=1000,
-            executed_price=1000,
             kis_order_id="0000012345",
         )
         client = FakeKisClient(
-            executions={"12345": {"executed_quantity": 1, "avg_price": 1050}}
+            executions={
+                "12345": {
+                    "executed_quantity": 1,
+                    "avg_price": 1050,
+                    "executed_amount": 1050,
+                }
+            }
         )
         result = services.reconcile_order_executions(kis_client=client)
 
         order.refresh_from_db()
-        self.assertEqual(result["reconciled"], 1)
+        self.monkey.refresh_from_db()
+        self.assertEqual(result["finalized"], 1)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(order.executed_price, 1050)
+        self.assertEqual(order.executed_quantity, 1)
+        # Cash debited by KIS's exact total amount (1000 − 1050).
+        self.assertEqual(self.monkey.balance, -50)
+        self.assertEqual(
+            Holding.objects.get(monkey=self.monkey, stock=self.stock).quantity, 1
+        )
+
+    def test_partial_fill_waits_midsession_then_settles_at_close(self):
+        # A buy of 10 @ ~1000 reserves 10,000; only 4 actually fill.
+        monkey = Monkey.objects.create(name="P", balance=20000, initial_balance=20000)
+        services.set_trading_enabled(True)
+        client = FakeKisClient(price=1000)
+        order = services.submit_monkey_order(
+            monkey.id,
+            self.stock.id,
+            Order.OrderTypeChoices.BUY,
+            10,
+            kis_client=client,
+        )
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+
+        # Mid-session: only a partial fill is reported — the order stays pending.
+        client.fill(order, quantity=4, avg_price=1000, amount=4000)
+        services.finalize_filled_orders(kis_client=client)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        monkey.refresh_from_db()
+        self.assertEqual(monkey.balance, 20000)  # untouched while pending
+
+        # After close: the partial is committed and the unfilled reserve is freed.
+        services.set_trading_enabled(False)
+        result = services.reconcile_order_executions(kis_client=client)
+        order.refresh_from_db()
+        monkey.refresh_from_db()
+        self.assertEqual(result["finalized"], 1)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
+        self.assertEqual(order.executed_quantity, 4)
+        # Only the 4 shares' real cost left the ledger — no starvation.
+        self.assertEqual(monkey.balance, 20000 - 4000)
+        self.assertEqual(services.available_cash(monkey), 16000)
+        self.assertEqual(
+            Holding.objects.get(monkey=monkey, stock=self.stock).quantity, 4
+        )
+
+    def test_zero_fill_settles_with_no_ledger_change(self):
+        # An accepted order that never executes (halt / no volume) settles flat.
+        monkey = Monkey.objects.create(name="Z", balance=5000, initial_balance=5000)
+        services.set_trading_enabled(True)
+        client = FakeKisClient(price=1000)
+        order = services.submit_monkey_order(
+            monkey.id,
+            self.stock.id,
+            Order.OrderTypeChoices.BUY,
+            3,
+            kis_client=client,
+        )
+        # No fill registered on the client at all.
+        services.set_trading_enabled(False)
+        result = services.reconcile_order_executions(kis_client=client)
+
+        order.refresh_from_db()
+        monkey.refresh_from_db()
+        self.assertEqual(result["finalized"], 1)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
+        self.assertEqual(order.executed_quantity, 0)
+        self.assertEqual(monkey.balance, 5000)
+        self.assertFalse(Holding.objects.filter(monkey=monkey).exists())
+        # Reserve released now that the order left the pending state.
+        self.assertEqual(services.available_cash(monkey), 5000)
+
+    def test_pending_buy_blocks_overspending(self):
+        # A monkey can't queue a second buy beyond its available (reserved) cash.
+        monkey = Monkey.objects.create(name="O", balance=3000, initial_balance=3000)
+        services.set_trading_enabled(True)
+        client = FakeKisClient(price=1000)
+        first = services.submit_monkey_order(
+            monkey.id, self.stock.id, Order.OrderTypeChoices.BUY, 2, kis_client=client
+        )
+        self.assertEqual(first.status, Order.StatusChoices.SUBMITTED)
+        self.assertEqual(services.available_cash(monkey), 1000)
+
+        # Second buy of 2 (cost 2000) exceeds the 1000 still available → rejected.
+        second = services.submit_monkey_order(
+            monkey.id, self.stock.id, Order.OrderTypeChoices.BUY, 2, kis_client=client
+        )
+        self.assertEqual(second.status, Order.StatusChoices.FAILED)
+        self.assertIn("Insufficient monkey balance", second.failure_reason)
 
     def test_reconcile_gated_on_global_switch(self):
-        # Reconciliation skips while the market is open (runs after close).
+        # The after-close finalize skips while the market is open.
         services.set_trading_enabled(True)
         result = services.reconcile_order_executions(kis_client=FakeKisClient())
         self.assertEqual(result, {"skipped": "market_open"})
@@ -1804,15 +1954,20 @@ class CachedPriceOrderTests(TestCase):
             def get_stock_price(self, ticker):
                 raise AssertionError("should not fetch live price when cached exists")
 
+        client = NoFetchClient()
         order = services.submit_monkey_order(
             monkey.id,
             stock.id,
             Order.OrderTypeChoices.BUY,
             1,
-            kis_client=NoFetchClient(),
+            kis_client=client,
         )
 
-        self.assertEqual(order.status, Order.StatusChoices.SUCCEEDED)
+        # Cached price is used as the estimate; the fill confirms it.
+        self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
+        self.assertEqual(order.estimated_price, 1234)
+        execute_order(client, order)
+        self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(order.executed_price, 1234)
 
 
@@ -1869,7 +2024,7 @@ class MonkeyListQueryCountTests(APITestCase):
                 monkey=monkey,
                 stock=stock,
                 order_type=Order.OrderTypeChoices.BUY,
-                status=Order.StatusChoices.SUCCEEDED,
+                status=Order.StatusChoices.EXECUTED,
                 requested_quantity=2,
                 executed_quantity=2,
                 estimated_price=500,
