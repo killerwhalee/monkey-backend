@@ -28,10 +28,11 @@ class MonkeyViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not (user and user.is_staff):
             qs = qs.filter(is_system=False)
-        # Read paths serialize per-monkey metrics/holdings; prefetch holdings and
-        # succeeded orders once so the helpers run no per-monkey/per-stock queries.
-        # Excluded for mutating actions (e.g. force-kill) so the response reflects
-        # post-mutation state rather than a stale prefetch.
+        # Read paths serialize per-monkey metrics/holdings; prefetch holdings,
+        # executed orders (for FIFO) and pending orders (for 주문가능금액) once so
+        # the helpers run no per-monkey/per-stock queries. Excluded for mutating
+        # actions (e.g. force-kill) so the response reflects post-mutation state
+        # rather than a stale prefetch.
         if self.action in ("list", "retrieve", "summary"):
             qs = qs.prefetch_related(
                 Prefetch(
@@ -41,10 +42,15 @@ class MonkeyViewSet(viewsets.ModelViewSet):
                 ),
                 Prefetch(
                     "orders",
-                    queryset=Order.objects.filter(status=Order.StatusChoices.SUCCEEDED)
+                    queryset=Order.objects.filter(status=Order.StatusChoices.EXECUTED)
                     .select_related("stock")
                     .order_by("created_at", "id"),
-                    to_attr="_succeeded_orders",
+                    to_attr="_executed_orders",
+                ),
+                Prefetch(
+                    "orders",
+                    queryset=Order.objects.filter(status=Order.StatusChoices.SUBMITTED),
+                    to_attr="_pending_orders",
                 ),
             )
         return qs

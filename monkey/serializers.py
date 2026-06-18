@@ -173,16 +173,17 @@ class DashboardSummarySerializer(serializers.Serializer):
 
 
 def _orders_by_stock(monkey):
-    """Succeeded orders grouped by ``stock_id``, ascending by (created_at, id).
+    """Executed orders grouped by ``stock_id``, ascending by (created_at, id).
 
-    Reuses the ``_succeeded_orders`` prefetch (set by ``MonkeyViewSet.get_queryset``
-    for list/retrieve) when present so the metrics/breakdown helpers run no extra
-    queries; otherwise queries once for this monkey.
+    Only EXECUTED orders moved the local ledger, so the FIFO/holdings math walks
+    those (pending SUBMITTED orders haven't touched balance/Holding yet). Reuses
+    the ``_executed_orders`` prefetch (set by ``MonkeyViewSet.get_queryset`` for
+    list/retrieve) when present; otherwise queries once for this monkey.
     """
-    prefetched = getattr(monkey, "_succeeded_orders", None)
+    prefetched = getattr(monkey, "_executed_orders", None)
     if prefetched is None:
         prefetched = (
-            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUCCEEDED)
+            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.EXECUTED)
             .select_related("stock")
             .order_by("created_at", "id")
         )
@@ -190,6 +191,17 @@ def _orders_by_stock(monkey):
     for order in prefetched:
         grouped.setdefault(order.stock_id, []).append(order)
     return grouped
+
+
+def _pending_orders_for(monkey):
+    """Accepted-but-unfilled (SUBMITTED) orders, reusing the ``_pending_orders``
+    prefetch when present so the metrics helper runs no extra per-monkey query."""
+    prefetched = getattr(monkey, "_pending_orders", None)
+    if prefetched is None:
+        prefetched = list(
+            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUBMITTED)
+        )
+    return list(prefetched)
 
 
 def _holdings_for(monkey, only_positive):
@@ -229,8 +241,18 @@ def build_monkey_metrics(monkey):
     earning_ratio = (
         (total_pl / monkey.initial_balance) if monkey.initial_balance else 0.0
     )
+
+    # 주문가능금액: settled cash minus what pending (SUBMITTED) buy orders reserve.
+    pending = _pending_orders_for(monkey)
+    buy_reserve = sum(
+        (order.estimated_price or 0) * (order.requested_quantity or 0)
+        for order in pending
+        if order.order_type == Order.OrderTypeChoices.BUY
+    )
     return {
         "cash_balance": monkey.balance,
+        "available_cash": monkey.balance - buy_reserve,
+        "pending_orders": len(pending),
         "holdings_value": holdings_value,
         "total_equity": total_equity,
         "total_pl": total_pl,
