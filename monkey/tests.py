@@ -1982,6 +1982,32 @@ class MonkeyStateLifecycleTests(TestCase):
         services.sync_monkey_periodic_tasks()
         self.assertFalse(self._task(active).enabled)
 
+    def test_sync_toggles_market_hours_tasks_with_market_state(self):
+        from django_celery_beat.models import PeriodicTask
+
+        market_hours_tasks = [
+            "monkey.update_held_stock_prices",
+            "monkey.run_system",
+            "monkey.index_tick",
+            "monkey.finalize_filled_orders",
+        ]
+
+        services.set_trading_enabled(True)
+        services.set_holiday_closed(False)
+        services.sync_monkey_periodic_tasks()
+        for name in market_hours_tasks:
+            self.assertTrue(
+                PeriodicTask.objects.get(name=name).enabled, f"{name} should be on"
+            )
+
+        # Market closed → every market-hours task (incl. finalize) is disabled.
+        services.set_trading_enabled(False)
+        services.sync_monkey_periodic_tasks()
+        for name in market_hours_tasks:
+            self.assertFalse(
+                PeriodicTask.objects.get(name=name).enabled, f"{name} should be off"
+            )
+
 
 class CashAllocationTests(TestCase):
     def setUp(self):

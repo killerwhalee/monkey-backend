@@ -150,11 +150,17 @@ def sync_monkey_periodic_tasks():
 
     # These tasks are market-hours tasks: they run whenever the exchange is open,
     # regardless of whether the manual kill-switch is set.
-    PeriodicTask.objects.filter(name="monkey.update_held_stock_prices").update(
-        enabled=market_open
-    )
-    PeriodicTask.objects.filter(name="monkey.run_system").update(enabled=market_open)
-    PeriodicTask.objects.filter(name="monkey.index_tick").update(enabled=market_open)
+    PeriodicTask.objects.filter(
+        name__in=[
+            "monkey.update_held_stock_prices",
+            "monkey.run_system",
+            "monkey.index_tick",
+            # Fully-filled orders only arrive while the market is open; no point
+            # polling KIS executions after close (the after-close sweep handles
+            # the rest), so disable this poll outside trading hours.
+            "monkey.finalize_filled_orders",
+        ]
+    ).update(enabled=market_open)
 
     # Bulk .update() bypasses the post_save signal beat listens on — nudge it.
     PeriodicTasks.update_changed()
