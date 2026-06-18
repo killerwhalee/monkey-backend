@@ -248,12 +248,15 @@ class KisClient:
         return False
 
     def get_daily_order_executions(self, start_date=None, end_date=None):
-        """Return executed quantity/avg price per KIS order number (ODNO).
+        """Return executed quantity/avg price/total amount per KIS order number.
 
         Walks the 주식일별주문체결조회 endpoint (paginating with the continuation
-        keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int}}``
-        for orders with at least one fill. ODNO keys are stripped of leading
-        zeros so they match however the order was originally recorded.
+        keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int,
+        "executed_amount": int}}`` for orders with at least one fill. ODNO keys
+        are stripped of leading zeros so they match however the order was
+        originally recorded. ``executed_amount`` is KIS's own 총체결금액
+        (``tot_ccld_amt``) — the exact won the trade moved — so the ledger debits
+        the real cash rather than a rounded ``qty × avg_price``.
         """
         today = timezone.localdate()
         start = (start_date or today).strftime("%Y%m%d")
@@ -292,9 +295,15 @@ class KisClient:
                 executed = int(item.get("tot_ccld_qty") or 0)
                 if not odno or executed <= 0:
                     continue
+                avg_price = round(float(item.get("avg_prvs") or 0))
+                # Prefer KIS's own total executed amount; fall back to qty × avg.
+                executed_amount = int(float(item.get("tot_ccld_amt") or 0)) or (
+                    executed * avg_price
+                )
                 executions[odno] = {
                     "executed_quantity": executed,
-                    "avg_price": round(float(item.get("avg_prvs") or 0)),
+                    "avg_price": avg_price,
+                    "executed_amount": executed_amount,
                 }
 
             tr_cont = response.headers.get("tr_cont", "")
