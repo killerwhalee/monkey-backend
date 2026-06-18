@@ -512,12 +512,14 @@ class MonkeyServiceTests(TestCase):
 
         self.assertEqual(len(monkeys), 2)
         self.assertEqual(Monkey.objects.filter(is_system=False).count(), 3)
+        starting_balance = services.get_global_control().auto_create_starting_balance
         for monkey in monkeys:
-            self.assertEqual(monkey.balance, self.account.auto_create_starting_balance)
+            self.assertEqual(monkey.balance, starting_balance)
 
     def test_auto_create_uses_configured_starting_balance(self):
-        self.account.auto_create_starting_balance = 500_000
-        self.account.save(update_fields=["auto_create_starting_balance"])
+        control = services.get_global_control()
+        control.auto_create_starting_balance = 500_000
+        control.save(update_fields=["auto_create_starting_balance"])
         fake_client = FakeKisClient(balance=1_500_000)
 
         with mock.patch("monkey.services.KisClient", return_value=fake_client):
@@ -528,9 +530,10 @@ class MonkeyServiceTests(TestCase):
             self.assertEqual(monkey.balance, 500_000)
 
     def test_create_monkeys_uses_configured_interval_range(self):
-        self.account.auto_create_min_interval_seconds = 300
-        self.account.auto_create_max_interval_seconds = 300
-        self.account.save(
+        control = services.get_global_control()
+        control.auto_create_min_interval_seconds = 300
+        control.auto_create_max_interval_seconds = 300
+        control.save(
             update_fields=[
                 "auto_create_min_interval_seconds",
                 "auto_create_max_interval_seconds",
@@ -982,15 +985,14 @@ class MonkeyApiTests(APITestCase):
         self.assertEqual(patch_response.data["manual_enabled"], False)
         self.assertEqual(patch_response.data["enabled"], False)
 
-    def test_admin_can_patch_account_config_fields(self):
-        # Auto-create config now lives per-account, edited via /accounts/{id}/.
-        account = make_account()
+    def test_admin_can_patch_global_config_fields(self):
+        # Auto-create config is global, edited via /global-monkey-control/current/.
         user = get_user_model().objects.create_user(
             username="admin", password="pw", is_staff=True
         )
         self.client.force_authenticate(user)
         response = self.client.patch(
-            reverse("account-detail", args=[account.id]),
+            reverse("global-monkey-control-current"),
             {
                 "auto_create_starting_balance": 250_000,
                 "auto_create_min_interval_seconds": 120,
@@ -999,22 +1001,18 @@ class MonkeyApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
-        account.refresh_from_db()
-        self.assertEqual(account.auto_create_starting_balance, 250_000)
-        self.assertEqual(account.auto_create_min_interval_seconds, 120)
-        self.assertEqual(account.auto_create_max_interval_seconds, 600)
-        # Keys are never returned in the response.
-        self.assertNotIn("app_key", response.data)
-        self.assertNotIn("app_secret", response.data)
+        control = services.get_global_control()
+        self.assertEqual(control.auto_create_starting_balance, 250_000)
+        self.assertEqual(control.auto_create_min_interval_seconds, 120)
+        self.assertEqual(control.auto_create_max_interval_seconds, 600)
 
     def test_patch_rejects_interval_max_below_min(self):
-        account = make_account()
         user = get_user_model().objects.create_user(
             username="admin", password="pw", is_staff=True
         )
         self.client.force_authenticate(user)
         response = self.client.patch(
-            reverse("account-detail", args=[account.id]),
+            reverse("global-monkey-control-current"),
             {
                 "auto_create_min_interval_seconds": 600,
                 "auto_create_max_interval_seconds": 300,
@@ -2249,19 +2247,19 @@ class SystemMonkeyVisibilityTests(APITestCase):
 
 class TraitTests(TestCase):
     def test_derive_interval_interpolates_across_min_max(self):
-        account = make_account()
-        account.auto_create_min_interval_seconds = 100
-        account.auto_create_max_interval_seconds = 1100
-        account.save(
+        control = services.get_global_control()
+        control.auto_create_min_interval_seconds = 100
+        control.auto_create_max_interval_seconds = 1100
+        control.save(
             update_fields=[
                 "auto_create_min_interval_seconds",
                 "auto_create_max_interval_seconds",
             ]
         )
         # haste=1 → fastest (min); haste=0 → slowest (max); 0.5 → midpoint.
-        self.assertEqual(services.derive_interval(1.0, account), 100)
-        self.assertEqual(services.derive_interval(0.0, account), 1100)
-        self.assertEqual(services.derive_interval(0.5, account), 600)
+        self.assertEqual(services.derive_interval(1.0, control), 100)
+        self.assertEqual(services.derive_interval(0.0, control), 1100)
+        self.assertEqual(services.derive_interval(0.5, control), 600)
 
     def test_mate_traits_stay_in_range_and_center_on_parent_mean(self):
         import random as _random
@@ -2308,12 +2306,13 @@ class TraitTests(TestCase):
             children = services.auto_create_monkeys()
 
         self.assertEqual(len(children), 2)
+        control = services.get_global_control()
         for child in children:
             self.assertTrue(services.TRAIT_FLOOR <= child.haste <= 1.0)
             self.assertTrue(services.TRAIT_FLOOR <= child.balls <= 1.0)
             self.assertEqual(
                 child.order_interval_seconds,
-                services.derive_interval(child.haste, account),
+                services.derive_interval(child.haste, control),
             )
 
 

@@ -1,6 +1,7 @@
 import json
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import OperationalError, ProgrammingError, models
 
@@ -48,24 +49,6 @@ class Account(models.Model):
         default=True,
         help_text="Soft-delete flag; inactive accounts keep their history but no longer trade.",
     )
-    auto_create_starting_balance = models.PositiveIntegerField(
-        "Auto-create starting balance",
-        default=1_000_000,
-        validators=[MinValueValidator(1)],
-        help_text="Cash each monkey on this account is created with.",
-    )
-    auto_create_min_interval_seconds = models.PositiveIntegerField(
-        "Min order interval (seconds)",
-        default=60,
-        validators=[MinValueValidator(60), MaxValueValidator(7200)],
-        help_text="Fastest cadence (haste=1) for this account's monkeys.",
-    )
-    auto_create_max_interval_seconds = models.PositiveIntegerField(
-        "Max order interval (seconds)",
-        default=1800,
-        validators=[MinValueValidator(60), MaxValueValidator(7200)],
-        help_text="Slowest cadence (haste=0) for this account's monkeys.",
-    )
     created_at = models.DateTimeField("Created at", auto_now_add=True)
     updated_at = models.DateTimeField("Updated at", auto_now=True)
 
@@ -74,14 +57,6 @@ class Account(models.Model):
             models.UniqueConstraint(
                 fields=["account_number", "product_code"],
                 name="unique_account_cano_product",
-            ),
-            models.CheckConstraint(
-                condition=models.Q(
-                    auto_create_max_interval_seconds__gte=models.F(
-                        "auto_create_min_interval_seconds"
-                    )
-                ),
-                name="account_interval_max_gte_min",
             ),
         ]
 
@@ -165,6 +140,24 @@ class GlobalMonkeyControl(models.Model):
         max_length=256,
         blank=True,
     )
+    auto_create_starting_balance = models.PositiveIntegerField(
+        "Auto-create starting balance",
+        default=1_000_000,
+        validators=[MinValueValidator(1)],
+        help_text="Cash each monkey is created with (auto-create divides unallocated cash by this).",
+    )
+    auto_create_min_interval_seconds = models.PositiveIntegerField(
+        "Min order interval (seconds)",
+        default=60,
+        validators=[MinValueValidator(60), MaxValueValidator(7200)],
+        help_text="Fastest possible cadence (haste=1). The haste trait interpolates the order interval across this min..max range.",
+    )
+    auto_create_max_interval_seconds = models.PositiveIntegerField(
+        "Max order interval (seconds)",
+        default=1800,
+        validators=[MinValueValidator(60), MaxValueValidator(7200)],
+        help_text="Slowest possible cadence (haste=0). The haste trait interpolates the order interval across this min..max range.",
+    )
     created_at = models.DateTimeField(
         "Created at",
         auto_now_add=True,
@@ -173,6 +166,18 @@ class GlobalMonkeyControl(models.Model):
         "Updated at",
         auto_now=True,
     )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(
+                    auto_create_max_interval_seconds__gte=models.F(
+                        "auto_create_min_interval_seconds"
+                    )
+                ),
+                name="globalcontrol_interval_max_gte_min",
+            ),
+        ]
 
     @property
     def market_open(self) -> bool:
@@ -183,6 +188,18 @@ class GlobalMonkeyControl(models.Model):
     def enabled(self) -> bool:
         """Effective monkey trading switch: every gate must be open."""
         return self.market_open and self.manual_enabled
+
+    def clean(self):
+        super().clean()
+        if (
+            self.auto_create_max_interval_seconds
+            < self.auto_create_min_interval_seconds
+        ):
+            raise ValidationError(
+                {
+                    "auto_create_max_interval_seconds": "최대 거래 주기는 최소 거래 주기 이상이어야 합니다."
+                }
+            )
 
     def __str__(self):
         return f"[{self.__class__.__name__} #{self.pk:04d}] enabled={self.enabled}"

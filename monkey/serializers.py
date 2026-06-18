@@ -124,13 +124,34 @@ class GlobalMonkeyControlSerializer(serializers.ModelSerializer):
             "time_enabled",
             "holiday_enabled",
             "manual_enabled",
+            "auto_create_starting_balance",
+            "auto_create_min_interval_seconds",
+            "auto_create_max_interval_seconds",
             "note",
             "created_at",
             "updated_at",
         ]
         # The time/holiday gates are owned by scheduled tasks; only the manual
-        # gate (and the note) may be changed through the API.
+        # gate (and the monkey-config fields/note) may be changed through the API.
         read_only_fields = ["time_enabled", "holiday_enabled"]
+
+    def validate(self, attrs):
+        # max >= min, accounting for partial (PATCH) updates that send only one.
+        low = attrs.get(
+            "auto_create_min_interval_seconds",
+            getattr(self.instance, "auto_create_min_interval_seconds", None),
+        )
+        high = attrs.get(
+            "auto_create_max_interval_seconds",
+            getattr(self.instance, "auto_create_max_interval_seconds", None),
+        )
+        if low is not None and high is not None and high < low:
+            raise serializers.ValidationError(
+                {
+                    "auto_create_max_interval_seconds": "최대 거래 주기는 최소 거래 주기 이상이어야 합니다."
+                }
+            )
+        return attrs
 
 
 class AccountSerializer(serializers.ModelSerializer):
@@ -151,9 +172,6 @@ class AccountSerializer(serializers.ModelSerializer):
             "account_number",
             "product_code",
             "is_active",
-            "auto_create_starting_balance",
-            "auto_create_min_interval_seconds",
-            "auto_create_max_interval_seconds",
             "token_status",
             "created_at",
             "updated_at",
@@ -166,24 +184,6 @@ class AccountSerializer(serializers.ModelSerializer):
             "has_token": token is not None,
             "expires_at": token.expires_at if token else None,
         }
-
-    def validate(self, attrs):
-        # max >= min, accounting for partial (PATCH) updates that send only one.
-        low = attrs.get(
-            "auto_create_min_interval_seconds",
-            getattr(self.instance, "auto_create_min_interval_seconds", None),
-        )
-        high = attrs.get(
-            "auto_create_max_interval_seconds",
-            getattr(self.instance, "auto_create_max_interval_seconds", None),
-        )
-        if low is not None and high is not None and high < low:
-            raise serializers.ValidationError(
-                {
-                    "auto_create_max_interval_seconds": "최대 거래 주기는 최소 거래 주기 이상이어야 합니다."
-                }
-            )
-        return attrs
 
 
 class KisAccessTokenSerializer(serializers.ModelSerializer):

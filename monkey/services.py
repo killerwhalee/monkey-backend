@@ -915,11 +915,11 @@ def mate_traits(parent_a, parent_b, rng=None):
     )
 
 
-def derive_interval(haste, account):
-    """Order interval interpolated across the account's min..max range by haste:
+def derive_interval(haste, control):
+    """Order interval interpolated across the global min..max range by haste:
     haste=1 → min (fastest), haste=0 → max (slowest)."""
-    low = account.auto_create_min_interval_seconds
-    high = account.auto_create_max_interval_seconds
+    low = control.auto_create_min_interval_seconds
+    high = control.auto_create_max_interval_seconds
     return round(low + (high - low) * (1 - haste))
 
 
@@ -937,6 +937,7 @@ def create_monkeys(account, count, starting_balance, rng=None):
     order interval is derived from the child's haste. Individual saves (not
     bulk_create) so Monkey.save() fires and creates the per-monkey PeriodicTask."""
     rng = rng or random
+    control = get_global_control()
     # Snapshot the parent pool (this account's alive monkeys) once so it's
     # deterministic for a given rng seed.
     parent_pool = list(_alive_monkeys().filter(account=account))
@@ -950,7 +951,7 @@ def create_monkeys(account, count, starting_balance, rng=None):
             initial_balance=starting_balance,
             haste=haste,
             balls=balls,
-            order_interval_seconds=derive_interval(haste, account),
+            order_interval_seconds=derive_interval(haste, control),
         )
         monkey.save()
         monkeys.append(monkey)
@@ -974,12 +975,12 @@ def create_monkeys_checked(account, count, starting_balance, kis_client=None):
 
 def auto_create_monkeys():
     """For each active mock account, create as many monkeys as its unallocated
-    cash affords."""
+    cash affords, using the global starting balance."""
+    starting_balance = get_global_control().auto_create_starting_balance
+    if starting_balance <= 0:
+        return []
     created = []
     for account in active_mock_accounts():
-        starting_balance = account.auto_create_starting_balance
-        if starting_balance <= 0:
-            continue
         try:
             available = unallocated_cash(account)
         except (KisClientError, ValueError):
