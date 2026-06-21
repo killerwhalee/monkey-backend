@@ -154,7 +154,6 @@ def sync_monkey_periodic_tasks():
         name__in=[
             "monkey.update_held_stock_prices",
             "monkey.run_system",
-            "monkey.index_tick",
             # Fully-filled orders only arrive while the market is open; no point
             # polling KIS executions after close (the after-close sweep handles
             # the rest), so disable this poll outside trading hours.
@@ -600,6 +599,7 @@ def build_index_returns():
 
 
 CANDLE_UNIT_SECONDS = {
+    "1t": None,  # one raw tick per candle — no time-bucketing
     "1m": 60,
     "15m": 900,
     "1h": 3600,
@@ -614,18 +614,36 @@ KST_OFFSET_SECONDS = 9 * 3600
 
 
 def build_index_candlesticks(unit="1d", limit=120, before=None):
-    """Bucket per-minute Monkey Index ticks into OHLC candlesticks.
+    """Bucket Monkey Index ticks into OHLC candlesticks.
 
-    ``unit`` is one of ``CANDLE_UNIT_SECONDS``. Each candle's ``time`` is the
-    bucket-start as epoch seconds (what lightweight-charts expects). ``1d``
-    buckets align to the local trading day; intraday units floor the absolute
-    timestamp to the unit width.
+    ``unit`` is one of ``CANDLE_UNIT_SECONDS``. ``"1t"`` returns one raw
+    candle per tick (O=H=L=C=value) with no time-bucketing; other units floor
+    the KST-offset timestamp to the unit width. Each candle's ``time`` is an
+    epoch second (what lightweight-charts expects).
 
-    ``before`` is an exclusive upper bound on the candle ``time`` (the same
-    KST-offset epoch the client holds): only candles strictly older than it are
-    returned. With ``limit`` this paginates backwards so the chart can lazily
-    load history as the user pans into the past.
+    ``before`` is an exclusive upper bound on the candle ``time``: only candles
+    strictly older than it are returned. With ``limit`` this paginates backwards.
     """
+    if unit == "1t":
+        rows = list(
+            MonkeyIndexTick.objects.order_by("recorded_at").values_list(
+                "recorded_at", "value"
+            )
+        )
+        candlesticks = [
+            {
+                "time": int(recorded_at.timestamp()) + KST_OFFSET_SECONDS,
+                "open": value,
+                "high": value,
+                "low": value,
+                "close": value,
+            }
+            for recorded_at, value in rows
+        ]
+        if before is not None:
+            candlesticks = [c for c in candlesticks if c["time"] < before]
+        return candlesticks[-limit:]
+
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
     buckets = {}
     for recorded_at, value in MonkeyIndexTick.objects.order_by(
@@ -697,7 +715,13 @@ def update_held_stock_prices(kis_client=None):
         except (KisClientError, ValueError):
             pass
 
-    return {"enabled": True, "updated": updated, "cache_refreshed": cache_refreshed}
+    tick = record_index_tick()
+    return {
+        "enabled": True,
+        "updated": updated,
+        "cache_refreshed": cache_refreshed,
+        "tick": tick,
+    }
 
 
 def update_all_stock_prices(kis_client=None):
