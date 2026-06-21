@@ -5,7 +5,7 @@ import time
 from datetime import timedelta
 
 from django.db import OperationalError, transaction
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.utils import timezone
 
 from market.models import Holding, Order, Stock
@@ -1332,16 +1332,15 @@ def _apply_execution(order, executed_quantity, executed_price, executed_amount):
     ``select_for_update()`` atomic block retried on transient DB locks. A zero
     fill (halt / no volume) records EXECUTED with no ledger change — the reserve
     is released simply because the order leaves the SUBMITTED state.
+
+    Idempotent: locking the order row at the start of each attempt ensures that if
+    two tasks (e.g. ``finalize_filled_orders`` and ``reconcile_order_executions``)
+    race on the same SUBMITTED order only one will apply the ledger change.
     """
     order.executed_quantity = executed_quantity
     order.executed_price = executed_price or None
     order.status = Order.StatusChoices.EXECUTED
     update_fields = ["status", "executed_quantity", "executed_price", "updated_at"]
-
-    if executed_quantity <= 0:
-        # Nothing traded — settle flat, no ledger change and no live-feed event.
-        order.save(update_fields=update_fields)
-        return order
 
     monkey_id = order.monkey_id
     stock_id = order.stock_id
@@ -1350,37 +1349,47 @@ def _apply_execution(order, executed_quantity, executed_price, executed_amount):
     for attempt in range(3):
         try:
             with transaction.atomic():
-                monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
-                if order_type == Order.OrderTypeChoices.BUY:
-                    monkey.balance -= executed_amount
-                    monkey.save(update_fields=["balance"])
-                    holding, _ = Holding.objects.select_for_update().get_or_create(
-                        monkey=monkey,
-                        stock_id=stock_id,
-                        defaults={"quantity": 0},
-                    )
-                    holding.quantity += executed_quantity
-                    holding.save(update_fields=["quantity"])
-                else:
-                    # The system monkey never retains cash: its sale proceeds are
-                    # left in the account as unallocated funds, so skip the balance
-                    # credit and keep its balance at 0.
-                    if not monkey.is_system:
-                        monkey.balance += executed_amount
-                        monkey.save(update_fields=["balance"])
-                    holding = (
-                        Holding.objects.select_for_update()
-                        .filter(monkey=monkey, stock_id=stock_id)
-                        .first()
-                    )
-                    if holding:
-                        holding.quantity -= executed_quantity
-                        _save_holding(holding)
-                order.save(update_fields=update_fields)
-            # Ledger committed — push the filled order to the live dashboard feed.
-            from monkey import realtime
+                # Lock the order row first; if another worker already applied this
+                # execution the status is no longer SUBMITTED — bail without touching
+                # the ledger so we never double-count holdings or cash.
+                locked = Order.objects.select_for_update().get(pk=order.pk)
+                if locked.status != Order.StatusChoices.SUBMITTED:
+                    return order
 
-            realtime.publish_order(order)
+                if executed_quantity > 0:
+                    monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
+                    if order_type == Order.OrderTypeChoices.BUY:
+                        monkey.balance -= executed_amount
+                        monkey.save(update_fields=["balance"])
+                        holding, _ = Holding.objects.select_for_update().get_or_create(
+                            monkey=monkey,
+                            stock_id=stock_id,
+                            defaults={"quantity": 0},
+                        )
+                        holding.quantity += executed_quantity
+                        holding.save(update_fields=["quantity"])
+                    else:
+                        # The system monkey never retains cash: its sale proceeds are
+                        # left in the account as unallocated funds, so skip the balance
+                        # credit and keep its balance at 0.
+                        if not monkey.is_system:
+                            monkey.balance += executed_amount
+                            monkey.save(update_fields=["balance"])
+                        holding = (
+                            Holding.objects.select_for_update()
+                            .filter(monkey=monkey, stock_id=stock_id)
+                            .first()
+                        )
+                        if holding:
+                            holding.quantity -= executed_quantity
+                            _save_holding(holding)
+
+                order.save(update_fields=update_fields)
+            # Ledger committed — push filled orders to the live dashboard feed.
+            if executed_quantity > 0:
+                from monkey import realtime
+
+                realtime.publish_order(order)
             return order
         except OperationalError:
             logger.warning(
@@ -1542,15 +1551,25 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
     holdings = list(
         Holding.objects.filter(
             monkey__account=account, stock__short_code=ticker, quantity__gt=0
-        ).select_related("stock")
+        ).select_related("monkey", "stock")
     )
     remaining = phantom_qty
     affected = []
+    # Accumulate refunds per monkey so we apply them in one DB update each.
+    monkey_refunds: dict[int, int] = {}
 
     def _reduce(holding, reduction):
         nonlocal remaining
         holding.quantity -= reduction
         _save_holding(holding)
+        # Refund the current market value of the removed phantom shares. Using
+        # current_price is an approximation — the exact buy price is buried in
+        # FIFO order history — but it's fair (monkey "sells" the ghost at market).
+        price = holding.stock.current_price or 0
+        if price > 0:
+            monkey_refunds[holding.monkey_id] = (
+                monkey_refunds.get(holding.monkey_id, 0) + reduction * price
+            )
         remaining -= reduction
         affected.append({"holding_id": holding.id, "reduced_by": reduction})
 
@@ -1576,6 +1595,9 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
             if holding.quantity <= 0:
                 continue
             _reduce(holding, min(remaining, holding.quantity))
+
+    for monkey_id, refund in monkey_refunds.items():
+        Monkey.objects.filter(id=monkey_id).update(balance=F("balance") + refund)
 
     return {
         "ticker": ticker,
