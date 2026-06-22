@@ -45,6 +45,18 @@ def notify_admin_new_feedback(feedback_id):
 
 
 @shared_task
+def send_feedback_confirmation_email(feedback_id):
+    feedback = Feedback.objects.get(pk=feedback_id)
+    _send_html_email(
+        subject=f"[Monkey] 문의가 접수되었습니다: {feedback.subject}",
+        template="confirm",
+        context={"feedback": feedback},
+        recipient_list=[feedback.email],
+    )
+    return {"feedback_id": feedback_id, "sent_to": feedback.email}
+
+
+@shared_task
 def send_feedback_reply_email(feedback_id):
     feedback = Feedback.objects.get(pk=feedback_id)
     _send_html_email(
