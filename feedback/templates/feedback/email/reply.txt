@@ -6,6 +6,9 @@
 분류: {{ feedback.get_category_display }}
 제목: {{ feedback.subject }}
 
+[내용]
+{{ feedback.message }}
+
 [답변]
 {{ feedback.reply_message }}
 
