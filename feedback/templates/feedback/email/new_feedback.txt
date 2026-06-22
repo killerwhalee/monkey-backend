@@ -1,0 +1,11 @@
+[Monkey 피드백] 새 피드백이 도착했습니다
+
+보낸 사람: {{ feedback.email }}
+분류: {{ feedback.get_category_display }}
+제목: {{ feedback.subject }}
+
+[내용]
+{{ feedback.message }}
+
+---
+원숭이 프로젝트 ({{ site_url }})

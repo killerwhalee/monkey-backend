@@ -156,8 +156,15 @@ class FeedbackTaskTests(APITestCase):
 
         self.assertEqual(result["notified"], "admin@example.com")
         self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(mail.outbox[0].to, ["admin@example.com"])
-        self.assertIn("버그 제목", mail.outbox[0].subject)
+        message = mail.outbox[0]
+        self.assertEqual(message.to, ["admin@example.com"])
+        self.assertIn("버그 제목", message.subject)
+        # Plain-text body carries the content; a branded HTML alternative is attached.
+        self.assertIn("버그 내용", message.body)
+        html_body, content_type = message.alternatives[0]
+        self.assertEqual(content_type, "text/html")
+        self.assertIn("MONKEY", html_body)
+        self.assertIn("발신 전용", html_body)
 
     def test_notify_admin_new_feedback_skips_when_unconfigured(self):
         feedback = Feedback.objects.create(
@@ -186,5 +193,10 @@ class FeedbackTaskTests(APITestCase):
 
         self.assertEqual(result["sent_to"], "visitor@example.com")
         self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(mail.outbox[0].to, ["visitor@example.com"])
-        self.assertEqual(mail.outbox[0].body, "답변 내용입니다.")
+        message = mail.outbox[0]
+        self.assertEqual(message.to, ["visitor@example.com"])
+        self.assertIn("답변 내용입니다.", message.body)
+        html_body, content_type = message.alternatives[0]
+        self.assertEqual(content_type, "text/html")
+        self.assertIn("답변 내용입니다.", html_body)
+        self.assertIn("발신 전용", html_body)

@@ -61,7 +61,7 @@ RUNNABLE_TASKS = [
         "현재 원숭이 지수 값을 시계열 틱으로 기록합니다. 장중에만 유효합니다.",
         [],
         "market_open",
-        False,  # automated every N seconds; no value in manual runs
+        False,
     ),
     (
         "update_all_stock_prices",
@@ -79,7 +79,7 @@ RUNNABLE_TASKS = [
         "원숭이들이 보유한 종목의 현재가를 KIS에서 새로 받아옵니다. 장중에만 유효합니다.",
         [],
         "market_open",
-        True,
+        False,
     ),
     (
         "run_system_monkey",
@@ -88,7 +88,7 @@ RUNNABLE_TASKS = [
         "시스템 원숭이가 보유한 종목 중 하나를 무작위로 골라 전량 매도합니다. 장중에만 실행됩니다.",
         [],
         "market_open",
-        True,
+        False,
     ),
     (
         "finalize_filled_orders",
@@ -136,7 +136,7 @@ RUNNABLE_TASKS = [
             "활성 원숭이들의 주기 작업이 활성화됩니다.",
         ],
         None,
-        False,  # automated by beat schedule; manually running out of sequence breaks state
+        False,
     ),
     (
         "market_close",
@@ -148,7 +148,7 @@ RUNNABLE_TASKS = [
             "원숭이들의 주기 작업이 비활성화됩니다.",
         ],
         None,
-        False,  # automated by beat schedule; manually running out of sequence breaks state
+        False,
     ),
     (
         "daily_maintenance",

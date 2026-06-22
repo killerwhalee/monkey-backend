@@ -802,10 +802,18 @@ def _finalize_orders(allow_partial, kis_client=None, lookback_days=1):
                 executed_amount = fill["executed_amount"] or (
                     executed_quantity * (executed_price or 0)
                 )
+                execution_detail = fill.get("raw") or {}
             else:
                 executed_price = None
                 executed_amount = 0
-            _apply_execution(order, executed_quantity, executed_price, executed_amount)
+                execution_detail = {}
+            _apply_execution(
+                order,
+                executed_quantity,
+                executed_price,
+                executed_amount,
+                execution_detail=execution_detail,
+            )
             finalized += 1
     return {"finalized": finalized}
 
@@ -1324,7 +1332,9 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     return order
 
 
-def _apply_execution(order, executed_quantity, executed_price, executed_amount):
+def _apply_execution(
+    order, executed_quantity, executed_price, executed_amount, execution_detail=None
+):
     """Apply a KIS-confirmed fill to the local ledger and mark the order EXECUTED.
 
     Moves cash by the *actual* executed amount (KIS's 총체결금액, not a rounded
@@ -1341,6 +1351,9 @@ def _apply_execution(order, executed_quantity, executed_price, executed_amount):
     order.executed_price = executed_price or None
     order.status = Order.StatusChoices.EXECUTED
     update_fields = ["status", "executed_quantity", "executed_price", "updated_at"]
+    if execution_detail:
+        order.execution_detail = execution_detail
+        update_fields.append("execution_detail")
 
     monkey_id = order.monkey_id
     stock_id = order.stock_id

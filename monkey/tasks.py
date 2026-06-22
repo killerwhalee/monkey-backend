@@ -1,7 +1,7 @@
 from celery import shared_task
 
 from monkey import services
-from monkey.kis import KisClient, KisClientError
+from monkey.kis import KisClient, KisClientError, single_instance
 from monkey.models import Account
 
 
@@ -101,7 +101,12 @@ def record_index_tick():
 
 @shared_task
 def update_held_stock_prices():
-    return services.update_held_stock_prices()
+    # Skip if a previous run is still draining the (rate-limited) KIS budget, so
+    # beat-scheduled instances can't pile up on the kis-aux queue.
+    with single_instance("update_held_stock_prices", ttl=300) as acquired:
+        if not acquired:
+            return {"skipped": "already_running"}
+        return services.update_held_stock_prices()
 
 
 @shared_task
@@ -113,7 +118,10 @@ def update_all_stock_prices():
 def finalize_filled_orders():
     if not services.get_global_control().market_open:
         return {"market_open": False}
-    return services.finalize_filled_orders()
+    with single_instance("finalize_filled_orders", ttl=300) as acquired:
+        if not acquired:
+            return {"skipped": "already_running"}
+        return services.finalize_filled_orders()
 
 
 @shared_task

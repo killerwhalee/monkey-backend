@@ -1,0 +1,47 @@
+{% extends "feedback/email/base.html" %}
+
+{% block title %}새 피드백 도착{% endblock %}
+{% block preheader %}{{ feedback.get_category_display }}: {{ feedback.subject }}{% endblock %}
+
+{% block content %}
+  <h1 style="margin: 0 0 16px; font-size: 20px; font-weight: 700; color: #0b1220;">
+    새 피드백이 도착했습니다
+  </h1>
+
+  <table
+    role="presentation"
+    width="100%"
+    cellpadding="0"
+    cellspacing="0"
+    style="margin: 0 0 24px; border: 1px solid #e6e8eb; border-radius: 10px;
+           background-color: #f8f9fb;"
+  >
+    <tr>
+      <td style="padding: 14px 18px; border-bottom: 1px solid #eceef1;">
+        <span style="font-size: 12px; color: #8a94a3;">보낸 사람</span><br />
+        <span style="font-size: 14px; color: #1f2933;">{{ feedback.email }}</span>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 14px 18px; border-bottom: 1px solid #eceef1;">
+        <span style="font-size: 12px; color: #8a94a3;">분류</span><br />
+        <span style="font-size: 14px; color: #1f2933;">{{ feedback.get_category_display }}</span>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 14px 18px;">
+        <span style="font-size: 12px; color: #8a94a3;">제목</span><br />
+        <span style="font-size: 14px; color: #1f2933;">{{ feedback.subject }}</span>
+      </td>
+    </tr>
+  </table>
+
+  <div style="margin: 0 0 8px; font-size: 13px; font-weight: 600; color: #10b981;">
+    내용
+  </div>
+  <div
+    style="padding: 18px 20px; background-color: #ffffff; border: 1px solid #e6e8eb;
+           border-left: 3px solid #10b981; border-radius: 8px; color: #1f2933;
+           white-space: pre-wrap; word-break: break-word;"
+  >{{ feedback.message }}</div>
+{% endblock %}
