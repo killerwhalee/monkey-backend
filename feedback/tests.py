@@ -18,6 +18,12 @@ class FeedbackApiTests(APITestCase):
         self.notify_delay = notify_patcher.start()
         self.addCleanup(notify_patcher.stop)
 
+        confirm_patcher = mock.patch.object(
+            tasks.send_feedback_confirmation_email, "delay"
+        )
+        self.confirm_delay = confirm_patcher.start()
+        self.addCleanup(confirm_patcher.stop)
+
         reply_patcher = mock.patch.object(tasks.send_feedback_reply_email, "delay")
         self.reply_delay = reply_patcher.start()
         self.addCleanup(reply_patcher.stop)
@@ -41,6 +47,7 @@ class FeedbackApiTests(APITestCase):
         self.assertEqual(feedback.category, "bug")
         self.assertEqual(feedback.status, Feedback.StatusChoices.NEW)
         self.notify_delay.assert_called_once_with(feedback.id)
+        self.confirm_delay.assert_called_once_with(feedback.id)
 
     def test_anonymous_cannot_list_or_retrieve_feedback(self):
         feedback = Feedback.objects.create(
@@ -179,6 +186,26 @@ class FeedbackTaskTests(APITestCase):
 
         self.assertIn("skipped", result)
         self.assertEqual(len(mail.outbox), 0)
+
+    def test_send_feedback_confirmation_email(self):
+        feedback = Feedback.objects.create(
+            email="visitor@example.com",
+            category="bug",
+            subject="버그를 발견했어요",
+            message="상세 내용입니다.",
+        )
+
+        result = tasks.send_feedback_confirmation_email(feedback.id)["output"]
+
+        self.assertEqual(result["sent_to"], "visitor@example.com")
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.to, ["visitor@example.com"])
+        self.assertIn("접수", message.body)
+        self.assertIn("상세 내용입니다.", message.body)
+        html_body, content_type = message.alternatives[0]
+        self.assertEqual(content_type, "text/html")
+        self.assertIn("상세 내용입니다.", html_body)
 
     def test_send_feedback_reply_email(self):
         feedback = Feedback.objects.create(

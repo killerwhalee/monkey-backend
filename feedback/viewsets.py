@@ -42,6 +42,7 @@ class FeedbackViewSet(
     def perform_create(self, serializer):
         feedback = serializer.save()
         tasks.notify_admin_new_feedback.delay(feedback.id)
+        tasks.send_feedback_confirmation_email.delay(feedback.id)
 
     @action(detail=True, methods=["post"], permission_classes=[permissions.IsAdminUser])
     def reply(self, request, pk=None):
