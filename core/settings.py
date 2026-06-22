@@ -67,6 +67,7 @@ INSTALLED_APPS = [
     "market",
     "monkey",
     "feedback",
+    "analytics",
 ]
 
 
