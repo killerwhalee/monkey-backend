@@ -195,6 +195,12 @@ class Order(models.Model):
         default=dict,
         blank=True,
     )
+    execution_detail = models.JSONField(
+        "Execution detail",
+        default=dict,
+        blank=True,
+        help_text="Raw KIS daily-ccld output1 fill record captured at confirmation.",
+    )
     created_at = models.DateTimeField(
         "Created at",
         auto_now_add=True,

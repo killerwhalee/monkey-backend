@@ -1,5 +1,6 @@
 import logging
 import time
+from contextlib import contextmanager
 from datetime import timedelta
 
 import requests
@@ -66,6 +67,36 @@ def kis_throttle(rate_limit_key, interval):
         return
     if wait > 0:
         time.sleep(wait)
+
+
+@contextmanager
+def single_instance(key, ttl):
+    """Yield ``True`` only if no other run holds ``key`` (Redis ``SET NX EX``).
+
+    Used to keep beat-scheduled maintenance tasks from piling up: while one run is
+    in flight, duplicate instances acquire nothing and skip immediately. The lock
+    auto-expires after ``ttl`` seconds so a crashed worker can't wedge the task. If
+    Redis is unreachable we fail open (yield ``True``) rather than halt the task.
+    """
+    redis_key = f"kis:lock:{key}"
+    acquired = False
+    client = None
+    try:
+        client = _get_redis()
+        acquired = bool(client.set(redis_key, str(time.time()), nx=True, ex=ttl))
+    except Exception:  # noqa: BLE001 — a lock glitch must not stall the task
+        yield True
+        return
+    if not acquired:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            client.delete(redis_key)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class KisClient:
@@ -258,7 +289,8 @@ class KisClient:
 
         Walks the 주식일별주문체결조회 endpoint (paginating with the continuation
         keys) and returns ``{odno: {"executed_quantity": int, "avg_price": int,
-        "executed_amount": int}}`` for orders with at least one fill. ODNO keys
+        "executed_amount": int, "raw": dict}}`` for orders with at least one fill,
+        where ``raw`` is the source output1 item (saved on the Order). ODNO keys
         are stripped of leading zeros so they match however the order was
         originally recorded. ``executed_amount`` is KIS's own 총체결금액
         (``tot_ccld_amt``) — the exact won the trade moved — so the ledger debits
@@ -313,6 +345,8 @@ class KisClient:
                     "executed_quantity": executed,
                     "avg_price": avg_price,
                     "executed_amount": executed_amount,
+                    # Raw output1 fill record, persisted on the Order for auditing.
+                    "raw": item,
                 }
 
             tr_cont = response.headers.get("tr_cont", "")

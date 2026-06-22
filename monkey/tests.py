@@ -125,10 +125,19 @@ class FakeKisClient:
         order.refresh_from_db()
         qty = order.requested_quantity if quantity is None else quantity
         price = order.estimated_price if avg_price is None else avg_price
-        self.executions[order.kis_order_id.lstrip("0")] = {
+        executed_amount = (qty * (price or 0)) if amount is None else amount
+        odno = order.kis_order_id.lstrip("0")
+        self.executions[odno] = {
             "executed_quantity": qty,
             "avg_price": price or 0,
-            "executed_amount": (qty * (price or 0)) if amount is None else amount,
+            "executed_amount": executed_amount,
+            # Mirror the real client's raw output1 fill record (saved on the Order).
+            "raw": {
+                "odno": odno,
+                "tot_ccld_qty": str(qty),
+                "avg_prvs": str(price or 0),
+                "tot_ccld_amt": str(executed_amount),
+            },
         }
         return self
 
@@ -1198,7 +1207,7 @@ class TaskScheduleApiTests(APITestCase):
         names = [row["name"] for row in response.data]
         self.assertNotIn("monkey.run.999", names)
         self.assertIn("monkey.update_held_stock_prices", names)
-        self.assertIn("monkey.index_tick", names)
+        self.assertIn("monkey.finalize_filled_orders", names)
         # Ascending by cadence.
         everys = [row["every"] for row in response.data]
         self.assertEqual(everys, sorted(everys))
@@ -1645,6 +1654,7 @@ class ExecutionReconciliationTests(TestCase):
                     "executed_quantity": 1,
                     "avg_price": 1050,
                     "executed_amount": 1050,
+                    "raw": {"odno": "12345", "tot_ccld_qty": "1", "avg_prvs": "1050"},
                 }
             }
         )
@@ -1657,6 +1667,8 @@ class ExecutionReconciliationTests(TestCase):
         self.assertEqual(order.status, Order.StatusChoices.EXECUTED)
         self.assertEqual(order.executed_price, 1050)
         self.assertEqual(order.executed_quantity, 1)
+        # The raw output1 fill record is captured on the order for auditing.
+        self.assertEqual(order.execution_detail["odno"], "12345")
         # Cash debited by KIS's exact total amount (1000 − 1050).
         self.assertEqual(self.monkey.balance, -50)
         self.assertEqual(
@@ -1988,7 +2000,6 @@ class MonkeyStateLifecycleTests(TestCase):
         market_hours_tasks = [
             "monkey.update_held_stock_prices",
             "monkey.run_system",
-            "monkey.index_tick",
             "monkey.finalize_filled_orders",
         ]
 
@@ -2554,6 +2565,30 @@ class RealtimePublisherTests(TestCase):
         with mock.patch("monkey.realtime.get_channel_layer", return_value=None):
             # Must not raise.
             realtime.publish_task("monkey.tasks.daily_maintenance", "id-1", "started")
+
+
+class SingleInstanceLockTests(TestCase):
+    def test_skips_when_lock_already_held(self):
+        # A second concurrent run gets nothing (SET NX returns False) → skips.
+        from monkey import tasks
+        from monkey.kis import single_instance
+
+        fake_redis = mock.Mock()
+        fake_redis.set.return_value = False
+        with mock.patch("monkey.kis._get_redis", return_value=fake_redis):
+            with single_instance("x", ttl=10) as acquired:
+                self.assertFalse(acquired)
+            # BaseTask wraps the return value in a {"output": ...} envelope.
+            result = tasks.update_held_stock_prices()
+        self.assertEqual(result["output"], {"skipped": "already_running"})
+
+    def test_fails_open_when_redis_unavailable(self):
+        # If Redis can't be reached the task must still run (lock yields True).
+        from monkey.kis import single_instance
+
+        with mock.patch("monkey.kis._get_redis", side_effect=RuntimeError("down")):
+            with single_instance("x", ttl=10) as acquired:
+                self.assertTrue(acquired)
 
 
 class ConsumerAuthTests(IsolatedAsyncioTestCase):

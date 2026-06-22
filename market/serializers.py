@@ -63,6 +63,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "kis_order_status",
             "kis_request",
             "kis_response",
+            "execution_detail",
             "created_at",
             "updated_at",
         ]
