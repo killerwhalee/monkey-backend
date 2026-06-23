@@ -201,6 +201,16 @@ class Order(models.Model):
         blank=True,
         help_text="Raw KIS daily-ccld output1 fill record captured at confirmation.",
     )
+    last_finalize_check = models.DateTimeField(
+        "Last finalize check",
+        null=True,
+        blank=True,
+        help_text=(
+            "When the mid-session finalize pass last queried this SUBMITTED order's "
+            "fill. Used to round-robin so one perpetually-partial order can't starve "
+            "the rest of the queue."
+        ),
+    )
     created_at = models.DateTimeField(
         "Created at",
         auto_now_add=True,
