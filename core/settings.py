@@ -98,22 +98,29 @@ CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 
 CELERY_TASK_DEFAULT_QUEUE = "default"
 
-# All KIS-touching tasks share a single queue drained by one concurrency-1 worker.
-# This prevents maintenance tasks (finalize_filled_orders, update_held_stock_prices)
-# from starving behind the per-account Redis rate limiter when a second worker
-# monopolises it with order tasks. single_instance() prevents pile-up within the queue.
+# KIS tasks are split by rate limit so the real account's higher budget (~18 req/s)
+# is not blocked by mock-account tasks (~1 req/s per account).
+#
+# kis_orders  — mock-account tasks (orders, system monkey, finalization, off-hours).
+#               Concurrency 1; throughput capped by the mock rate limiter.
+# kis_prices  — account-free price polling via the real account (~18 req/s).
+#               Concurrency 1; runs independently of order traffic.
+# default     — non-KIS tasks (no rate limiter).
 CELERY_TASK_ROUTES = {
+    # Mock account (~1 req/s): orders and all mock-account maintenance
     "monkey.tasks.run_monkey": {"queue": "kis_orders"},
     "monkey.tasks.run_monkeys": {"queue": "kis_orders"},
-    "monkey.tasks.get_stock_price": {"queue": "kis_orders"},
-    "monkey.tasks.update_held_stock_prices": {"queue": "kis_orders"},
+    "monkey.tasks.run_system_monkey": {"queue": "kis_orders"},
     "monkey.tasks.finalize_filled_orders": {"queue": "kis_orders"},
     "monkey.tasks.reconcile_executions": {"queue": "kis_orders"},
     "monkey.tasks.update_token": {"queue": "kis_orders"},
     "monkey.tasks.check_holiday": {"queue": "kis_orders"},
     "monkey.tasks.auto_create_monkeys": {"queue": "kis_orders"},
-    # Non-KIS: cull + snapshot + index baseline. On the always-on default queue so
-    # on-demand and off-hours runs are consumed without touching the KIS worker.
+    # Real account (~18 req/s): price polling via get_account_free_client()
+    "monkey.tasks.get_stock_price": {"queue": "kis_prices"},
+    "monkey.tasks.update_held_stock_prices": {"queue": "kis_prices"},
+    "monkey.tasks.update_all_stock_prices": {"queue": "kis_prices"},
+    # Non-KIS: cull + snapshot + index baseline
     "monkey.tasks.daily_maintenance": {"queue": "default"},
 }
 
