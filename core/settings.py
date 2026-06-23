@@ -80,6 +80,11 @@ CELERY_RESULT_BACKEND = "django-db"
 # Record task name + args + kwargs on every TaskResult row for easy debugging.
 CELERY_RESULT_EXTENDED = True
 
+# Emit the STARTED state when a worker picks up a task so TaskResult.date_started
+# is populated — lets us measure queue-wait time (date_started - date_created) and
+# execution time (date_done - date_started).
+CELERY_TASK_TRACK_STARTED = True
+
 CELERY_ACCEPT_CONTENT = ["application/json"]
 
 CELERY_TASK_SERIALIZER = "json"
