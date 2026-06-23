@@ -102,7 +102,7 @@ def record_index_tick():
 @shared_task
 def update_held_stock_prices():
     # Skip if a previous run is still draining the (rate-limited) KIS budget, so
-    # beat-scheduled instances can't pile up on the kis-aux queue.
+    # beat-scheduled instances can't pile up on the kis_orders queue.
     with single_instance("update_held_stock_prices", ttl=300) as acquired:
         if not acquired:
             return {"skipped": "already_running"}
