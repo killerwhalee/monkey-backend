@@ -284,7 +284,7 @@ class KisClient:
                 return str(entry.get("opnd_yn")).upper() != "Y"
         return False
 
-    def get_daily_order_executions(self, start_date=None, end_date=None):
+    def get_daily_order_executions(self, start_date=None, end_date=None, odno=None):
         """Return executed quantity/avg price/total amount per KIS order number.
 
         Walks the 주식일별주문체결조회 endpoint (paginating with the continuation
@@ -294,7 +294,10 @@ class KisClient:
         are stripped of leading zeros so they match however the order was
         originally recorded. ``executed_amount`` is KIS's own 총체결금액
         (``tot_ccld_amt``) — the exact won the trade moved — so the ledger debits
-        the real cash rather than a rounded ``qty × avg_price``.
+        the real cash rather than a rounded ``qty * avg_price``.
+
+        When ``odno`` is given KIS filters the result to that one order, so the
+        loop completes in a single page (one API call).
         """
         today = timezone.localdate()
         start = (start_date or today).strftime("%Y%m%d")
@@ -304,6 +307,7 @@ class KisClient:
         ctx_fk = ""
         ctx_nk = ""
         tr_cont = ""
+
         for _ in range(50):  # hard cap so a malformed continuation can't loop forever
             response = self._execute(
                 "GET",
@@ -322,7 +326,7 @@ class KisClient:
                     "PDNO": "",
                     "CCLD_DVSN": "00",
                     "ORD_GNO_BRNO": "",
-                    "ODNO": "",
+                    "ODNO": (odno or "").lstrip("0"),
                     "INQR_DVSN_3": "00",
                     "INQR_DVSN_1": "",
                     "EXCG_ID_DVSN_CD": "KRX",
@@ -331,13 +335,14 @@ class KisClient:
                 },
             )
             data = response.json()
+
             for item in data.get("output1") or []:
                 odno = str(item.get("odno") or "").lstrip("0")
                 executed = int(item.get("tot_ccld_qty") or 0)
                 if not odno or executed <= 0:
                     continue
                 avg_price = round(float(item.get("avg_prvs") or 0))
-                # Prefer KIS's own total executed amount; fall back to qty × avg.
+                # Prefer KIS's own total executed amount; fall back to qty * avg.
                 executed_amount = int(float(item.get("tot_ccld_amt") or 0)) or (
                     executed * avg_price
                 )
@@ -352,6 +357,7 @@ class KisClient:
             tr_cont = response.headers.get("tr_cont", "")
             if tr_cont not in ("F", "M"):
                 break
+
             ctx_fk = data.get("ctx_area_fk100", "")
             ctx_nk = data.get("ctx_area_nk100", "")
 
@@ -419,6 +425,7 @@ class KisClient:
         send = requests.post if method == "POST" else requests.get
         attempts = max(1, getattr(settings, "KIS_MAX_RETRIES", 0) + 1)
         last_error = None
+
         for attempt in range(attempts):
             kis_throttle(self.rate_limit_key, self.rate_limit_interval)
             try:
@@ -450,6 +457,7 @@ class KisClient:
                 )
             if attempt + 1 < attempts:
                 time.sleep(0.15)  # KIS guidance: brief term, then re-call
+
         raise last_error or KisClientError(f"KIS request failed: {url}")
 
     @staticmethod

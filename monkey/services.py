@@ -1,10 +1,9 @@
 import logging
 import math
 import random
-import time
 from datetime import timedelta
 
-from django.db import OperationalError, transaction
+from django.db import transaction
 from django.db.models import F, Sum
 from django.utils import timezone
 
@@ -56,6 +55,7 @@ def soft_delete_account(account):
             Monkey.objects.filter(account=account).values_list("id", flat=True)
         )
         Holding.objects.filter(monkey_id__in=monkey_ids).delete()
+
         # Mark every monkey on the account DEAD (Monkey.save() drops each task).
         for monkey in Monkey.objects.filter(account=account):
             monkey.state = Monkey.State.DEAD
@@ -63,6 +63,7 @@ def soft_delete_account(account):
             monkey.save(update_fields=["state", "killed_at"])
 
         KisAccountCache.objects.filter(account=account).delete()
+
         # Token is a real KIS secret; drop it too. (CASCADE would also handle this
         # on a hard delete, but soft-delete keeps the row.)
         from monkey.models import KisAccessToken
@@ -73,6 +74,7 @@ def soft_delete_account(account):
         account.app_secret = ""
         account.is_active = False
         account.save(update_fields=["app_key", "app_secret", "is_active", "updated_at"])
+
     return account
 
 
@@ -88,8 +90,10 @@ def get_account_free_client():
             is_active=True, account_type=Account.AccountType.MOCK
         ).first()
     )
+
     if account is None:
         raise NoAccountAvailableError("등록된 활성 계좌가 없습니다.")
+
     return KisClient(account)
 
 
@@ -102,9 +106,12 @@ def set_trading_enabled(enabled: bool, note: str = "") -> GlobalMonkeyControl:
     """Open/close the *time* gate. Used by market_open / market_close tasks."""
     control = get_global_control()
     control.time_enabled = enabled
+
     if note:
         control.note = note
+
     control.save(update_fields=["time_enabled", "note", "updated_at"])
+
     return control
 
 
@@ -112,9 +119,12 @@ def set_holiday_closed(is_holiday: bool, note: str = "") -> GlobalMonkeyControl:
     """Open/close the *holiday* gate. Used by the daily check_holiday task."""
     control = get_global_control()
     control.holiday_enabled = not is_holiday
+
     if note:
         control.note = note
+
     control.save(update_fields=["holiday_enabled", "note", "updated_at"])
+
     return control
 
 
@@ -142,10 +152,13 @@ def sync_monkey_periodic_tasks():
     }
 
     enabled_count = 0
+
     for task in PeriodicTask.objects.filter(task="monkey.tasks.run_monkey"):
         desired = monkey_active and task.name in active_names
+
         if task.enabled != desired:
             PeriodicTask.objects.filter(pk=task.pk).update(enabled=desired)
+
         enabled_count += int(desired)
 
     # These tasks are market-hours tasks: they run whenever the exchange is open,
@@ -157,12 +170,13 @@ def sync_monkey_periodic_tasks():
             # Fully-filled orders only arrive while the market is open; no point
             # polling KIS executions after close (the after-close sweep handles
             # the rest), so disable this poll outside trading hours.
-            "monkey.finalize_filled_orders",
+            "monkey.finalize_order",
         ]
     ).update(enabled=market_open)
 
     # Bulk .update() bypasses the post_save signal beat listens on — nudge it.
     PeriodicTasks.update_changed()
+
     return {"gate_open": monkey_active, "active_monkey_tasks": enabled_count}
 
 
@@ -178,6 +192,7 @@ def _crontab_hour_minute(crontab):
     """Concrete (hour, minute) for a crontab, or (None, None) for ranges/wildcards."""
     try:
         return int(crontab.hour), int(crontab.minute)
+
     except (TypeError, ValueError):
         return None, None
 
@@ -186,6 +201,7 @@ def _serialize_task_schedule(task):
     from monkey.task_catalog import DESCRIPTION_BY_TASK_PATH, LABEL_BY_TASK_PATH
 
     hour, minute = _crontab_hour_minute(task.crontab)
+
     return {
         "id": task.id,
         "name": task.name,
@@ -214,6 +230,7 @@ def list_task_schedules():
     ]
     # Ascending by scheduled time; any non-concrete time sorts last.
     rows.sort(key=lambda r: (r["hour"] is None, r["hour"] or 0, r["minute"] or 0))
+
     return rows
 
 
@@ -239,10 +256,12 @@ def get_market_hours():
     }
 
     result = {}
+
     for key, name in names.items():
         task = tasks.get(name)
         hour, minute = _crontab_hour_minute(task.crontab) if task else (None, None)
         result[key] = {"hour": hour, "minute": minute}
+
     return result
 
 
@@ -252,8 +271,10 @@ def set_task_schedule(task_id, hour, minute):
 
     try:
         task = PeriodicTask.objects.select_related("crontab").get(pk=task_id)
+
     except PeriodicTask.DoesNotExist as exc:
         raise ScheduleNotFoundError(str(task_id)) from exc
+
     if task.crontab is None:
         raise NotATimeScheduleError(task.name)
 
@@ -266,16 +287,21 @@ def set_task_schedule(task_id, hour, minute):
         month_of_year=old.month_of_year,
         timezone=old.timezone,
     )
+
     if schedule.pk != old.pk:
         task.crontab = schedule
+
         # save() fires the post_save signal beat watches, so it reloads.
         task.save(update_fields=["crontab"])
+
         # Drop the old schedule if nothing else references it.
         if not PeriodicTask.objects.filter(crontab=old).exists():
             old.delete()
+
         logger.info(
             "rescheduled %s to %02d:%02d KST", task.name, int(hour), int(minute)
         )
+
     return _serialize_task_schedule(task)
 
 
@@ -313,6 +339,7 @@ def list_interval_schedules():
         .select_related("interval")
     ]
     rows.sort(key=lambda r: (r["every"] is None, r["every"] or 0))
+
     return rows
 
 
@@ -322,10 +349,13 @@ def set_interval_schedule(task_id, every):
 
     try:
         task = PeriodicTask.objects.select_related("interval").get(pk=task_id)
+
     except PeriodicTask.DoesNotExist as exc:
         raise ScheduleNotFoundError(str(task_id)) from exc
+
     if task.interval is None:
         raise NotATimeScheduleError(task.name)
+
     if task.task == _PER_MONKEY_TASK:
         raise NotATimeScheduleError(task.name)
 
@@ -334,14 +364,19 @@ def set_interval_schedule(task_id, every):
         every=every,
         period=old.period,
     )
+
     if interval.pk != old.pk:
         task.interval = interval
+
         # save() fires the post_save signal beat watches, so it reloads.
         task.save(update_fields=["interval"])
+
         # Drop the old interval if nothing else references it.
         if not PeriodicTask.objects.filter(interval=old).exists():
             old.delete()
+
         logger.info("rescheduled %s to every %ss", task.name, every)
+
     return _serialize_interval_schedule(task)
 
 
@@ -362,9 +397,11 @@ def kill_monkey(monkey: Monkey) -> Monkey:
     monkey.state = Monkey.State.DEAD
     monkey.killed_at = timezone.now()
     monkey.save(update_fields=["state", "killed_at"])
+
     from monkey import realtime
 
     realtime.publish_monkey_updated(monkey)
+
     return monkey
 
 
@@ -389,6 +426,7 @@ def kill_inactive_monkeys() -> int:
         .order_by("-date")
         .values_list("date", flat=True)[:INACTIVITY_KILL_DAYS]
     )
+
     if len(recent_days) < INACTIVITY_KILL_DAYS:
         return 0  # not enough trading history yet to judge inactivity
 
@@ -407,15 +445,18 @@ def kill_inactive_monkeys() -> int:
             ),
             created_at__date__in=recent_days,
         ).exists()
+
         if not had_order:
             kill_monkey(monkey)
             killed += 1
+
     return killed
 
 
 def snapshot_all_monkeys(target_date=None):
     if get_global_control().market_open:
         return {"skipped": "market_open"}
+
     # Deferred import: serializers.py does `from monkey import services`, so importing
     # build_monkey_metrics at module load time would create a circular import (same
     # pattern as the deferred `from market.models import Order` in monkey/kis.py).
@@ -423,6 +464,7 @@ def snapshot_all_monkeys(target_date=None):
 
     target_date = target_date or timezone.localdate()
     count = 0
+
     for monkey in Monkey.objects.filter(is_system=False).order_by("id"):
         metrics = build_monkey_metrics(monkey)
         # available_cash / pending_orders are live, intraday-only figures — not
@@ -435,6 +477,7 @@ def snapshot_all_monkeys(target_date=None):
             defaults=metrics,
         )
         count += 1
+
     return {"date": target_date.isoformat(), "snapshots": count}
 
 
@@ -488,8 +531,10 @@ def capture_index_baseline(target_date=None):
         .order_by("recorded_at")
         .last()
     )
+
     if last_tick is not None:
         base_index = last_tick.value
+
     else:
         prior_baseline = (
             MonkeyIndexBaseline.objects.filter(date__lt=target_date)
@@ -502,29 +547,31 @@ def capture_index_baseline(target_date=None):
         date=target_date,
         defaults={"base_index": base_index, "base_equity": _alive_equity()},
     )
+
     return baseline
 
 
-def record_index_tick():
-    """Sample the current Monkey Index value: ``base_index * (b / a)``. Gated on
-    the global kill switch (mirrors run_monkey) so each day's ticks form a clean
-    trading-session candle. Skips if today's baseline hasn't been captured yet."""
-    if not get_global_control().market_open:
-        return {"market_open": False}
-
+def _record_index_tick():
+    """Sample the current Monkey Index value: ``base_index * (b / a)``.
+    Skips if today's baseline hasn't been captured yet. Caller is responsible
+    for gating on market hours."""
     baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
+
     if baseline is None:
-        return {"enabled": True, "baseline": False}
+        return {"baseline": False}
 
     if baseline.base_equity:
         value = baseline.base_index * (_alive_equity() / baseline.base_equity)
+
     else:
         value = baseline.base_index
+
     tick = MonkeyIndexTick.objects.create(value=value)
+
     from monkey import realtime
 
     realtime.publish_index_tick(value, tick.recorded_at)
-    return {"enabled": True, "tick_id": tick.id, "value": value}
+    return {"tick_id": tick.id, "value": value}
 
 
 def current_index_value():
@@ -536,12 +583,17 @@ def current_index_value():
         .order_by("recorded_at")
         .last()
     )
+
     if last_tick is not None:
         return last_tick.value
+
     baseline = MonkeyIndexBaseline.objects.filter(date=today).first()
+
     if baseline is not None:
         return baseline.base_index
+
     last_baseline = MonkeyIndexBaseline.objects.order_by("date").last()
+
     return last_baseline.base_index if last_baseline else MONKEY_INDEX_BASE
 
 
@@ -563,15 +615,19 @@ def _index_close_on_or_before(target_date):
         .order_by("recorded_at")
         .last()
     )
+
     if tick is not None:
         return timezone.localtime(tick.recorded_at).date(), tick.value
+
     baseline = (
         MonkeyIndexBaseline.objects.filter(date__lte=target_date)
         .order_by("date")
         .last()
     )
+
     if baseline is not None:
         return baseline.date, baseline.base_index
+
     return None
 
 
@@ -584,17 +640,20 @@ def build_index_returns():
     today = timezone.localdate()
     current = current_index_value()
     periods = {}
+
     for key, days in INDEX_RETURN_PERIODS.items():
         reference = _index_close_on_or_before(today - timedelta(days=days))
         if reference is None:
             periods[key] = None
             continue
+
         ref_date, ref_value = reference
         periods[key] = {
             "date": ref_date.isoformat(),
             "index": ref_value,
             "rate": (current / ref_value - 1) if ref_value else None,
         }
+
     return {"current": current, "periods": periods}
 
 
@@ -640,8 +699,10 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             }
             for recorded_at, value in rows
         ]
+
         if before is not None:
             candlesticks = [c for c in candlesticks if c["time"] < before]
+
         return candlesticks[-limit:]
 
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
@@ -653,9 +714,11 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             local = timezone.localtime(recorded_at)
             midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
             bucket = int(midnight.timestamp()) + KST_OFFSET_SECONDS
+
         else:
             ts = int(recorded_at.timestamp()) + KST_OFFSET_SECONDS
             bucket = ts - (ts % seconds)
+
         buckets.setdefault(bucket, []).append(value)
 
     candlesticks = [
@@ -668,25 +731,25 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
         }
         for bucket, values in sorted(buckets.items())
     ]
+
     if before is not None:
         candlesticks = [candle for candle in candlesticks if candle["time"] < before]
+
     return candlesticks[-limit:]
 
 
 def update_held_stock_prices(kis_client=None):
     """Refresh live prices for every stock currently held by any monkey.
 
-    Gated on the global switch like record_earning_ratio_tick so prices are only
-    polled during a live trading session. These prices feed holdings valuation,
-    average-price/earning-rate breakdowns, and equity metrics.
+    Caller is responsible for gating on market hours. These prices feed holdings
+    valuation, average-price/earning-rate breakdowns, and equity metrics.
     """
-    if not get_global_control().market_open:
-        return {"market_open": False}
-
     try:
         kis_client = kis_client or get_account_free_client()
+
     except NoAccountAvailableError:
         return {"enabled": True, "updated": 0, "cache_refreshed": 0}
+
     stock_ids = list(
         Holding.objects.filter(quantity__gt=0, stock__is_active=True)
         .values_list("stock_id", flat=True)
@@ -695,11 +758,14 @@ def update_held_stock_prices(kis_client=None):
 
     now = timezone.now()
     updated = 0
+
     for stock in Stock.objects.filter(id__in=stock_ids):
         try:
             price = kis_client.get_stock_price(stock.ticker)
+
         except (KisClientError, ValueError):
             continue
+
         stock.current_price = price
         stock.price_updated_at = now
         stock.save(update_fields=["current_price", "price_updated_at"])
@@ -708,14 +774,17 @@ def update_held_stock_prices(kis_client=None):
     # Refresh each mock account's balance cache on this market-hours poll so the
     # admin "내 자산 현황" card serves cached figures (no live KIS call per request).
     cache_refreshed = 0
+
     for account in active_mock_accounts():
         try:
             refresh_account_cache(account)
             cache_refreshed += 1
+
         except (KisClientError, ValueError):
             pass
 
-    tick = record_index_tick()
+    tick = _record_index_tick()
+
     return {
         "enabled": True,
         "updated": updated,
@@ -738,110 +807,120 @@ def update_all_stock_prices(kis_client=None):
     now = timezone.now()
     updated = 0
     failed = 0
+
     for stock in Stock.objects.filter(is_active=True).order_by("id"):
         try:
             price = kis_client.get_stock_price(stock.ticker)
+
         except (KisClientError, ValueError):
             failed += 1
             continue
+
         stock.current_price = price
         stock.price_updated_at = now
         stock.save(update_fields=["current_price", "price_updated_at"])
         updated += 1
+
     return {"updated": updated, "failed": failed}
 
 
-def _finalize_orders(allow_partial, kis_client=None, lookback_days=1):
-    """Apply KIS fills to pending (SUBMITTED) orders, mutating the local ledger.
+def finalize_submitted_order(order, allow_partial, kis_client=None):
+    """Query KIS for one SUBMITTED order's fill and apply it (one KIS API call).
 
-    Polls each account's daily order-execution inquiry and, matching by KIS order
-    number (ODNO), applies each fill via ``_apply_execution`` with KIS's real
-    quantity, average price, and total amount.
+    ``allow_partial=False`` (mid-session): skip if not fully filled yet, leaving
+    the order SUBMITTED for a later pass.
+    ``allow_partial=True`` (after close): commit whatever filled — partial or zero
+    — so nothing stays pending overnight.
 
-    ``allow_partial=False`` (mid-session): finalize an order only once it is
-    FULLY filled (``executed_quantity >= requested_quantity``); leave partials
-    SUBMITTED so later fills in the same session accumulate before we commit.
-
-    ``allow_partial=True`` (after close): finalize EVERY remaining pending order
-    with whatever it filled — a partial, or zero when KIS shows no fill — so
-    nothing stays pending (and reserving funds/shares) overnight.
-
-    When ``kis_client`` is given it is used for *all* pending orders (the test
-    seam / single-account path); otherwise each active mock account is polled
-    with its own credentials and only its monkeys' orders are finalized.
+    Returns the updated order, or ``None`` when the order is skipped mid-session.
     """
-    start = timezone.localdate() - timedelta(days=lookback_days)
-    cutoff = timezone.now() - timedelta(days=lookback_days + 1)
+    if kis_client is None:
+        if order.monkey is None or order.monkey.account is None:
+            return None
+        kis_client = KisClient(order.monkey.account)
 
-    if kis_client is not None:
-        batches = [(None, kis_client)]
-    else:
-        batches = [(account, KisClient(account)) for account in active_mock_accounts()]
+    executions = kis_client.get_daily_order_executions(odno=order.kis_order_id)
+    fill = executions.get(order.kis_order_id.lstrip("0"))
 
-    finalized = 0
-    for account, client in batches:
-        executions = client.get_daily_order_executions(start_date=start)
-        orders = Order.objects.filter(
-            status=Order.StatusChoices.SUBMITTED,
-            created_at__gte=cutoff,
+    executed_quantity = fill["executed_quantity"] if fill else 0
+    if not allow_partial and executed_quantity < order.requested_quantity:
+        return None
+
+    if fill:
+        executed_price = fill["avg_price"] or order.estimated_price
+        executed_amount = fill["executed_amount"] or (
+            executed_quantity * (executed_price or 0)
         )
-        if account is not None:
-            orders = orders.filter(monkey__account=account)
-        for order in orders:
-            fill = (
-                executions.get(order.kis_order_id.lstrip("0"))
-                if order.kis_order_id
-                else None
-            )
-            executed_quantity = fill["executed_quantity"] if fill else 0
-            if not allow_partial and executed_quantity < order.requested_quantity:
-                # Mid-session: not fully filled yet — leave it for later fills.
-                continue
-            if fill:
-                executed_price = fill["avg_price"] or order.estimated_price
-                executed_amount = fill["executed_amount"] or (
-                    executed_quantity * (executed_price or 0)
-                )
-                execution_detail = fill.get("raw") or {}
-            else:
-                executed_price = None
-                executed_amount = 0
-                execution_detail = {}
-            _apply_execution(
-                order,
-                executed_quantity,
-                executed_price,
-                executed_amount,
-                execution_detail=execution_detail,
-            )
-            finalized += 1
-    return {"finalized": finalized}
+        execution_detail = fill.get("raw") or {}
+
+    else:
+        executed_price = None
+        executed_amount = 0
+        execution_detail = {}
+
+    return _apply_execution(
+        order,
+        executed_quantity,
+        executed_price,
+        executed_amount,
+        execution_detail=execution_detail,
+    )
 
 
-def finalize_filled_orders(kis_client=None):
-    """Mid-session sweep: apply fully-filled pending orders to the ledger.
+def finalize_order(kis_client=None):
+    """Mid-session: finalize the oldest pending SUBMITTED order (one KIS call).
 
-    Most market orders fill within minutes, so running this on a short interval
-    surfaces the resulting holdings/cash promptly. Partially-filled orders are
-    left pending for the after-close sweep.
+    Caller must gate on market hours. Designed to be run very frequently so
+    SUBMITTED orders are picked up promptly without each invocation fetching
+    every account's full paginated execution list.
     """
-    return _finalize_orders(allow_partial=False, kis_client=kis_client)
+    order = (
+        Order.objects.filter(
+            status=Order.StatusChoices.SUBMITTED,
+            kis_order_id__gt="",
+        )
+        .select_related("monkey__account")
+        .order_by("created_at")
+        .first()
+    )
+
+    if order is None:
+        return {"finalized": 0}
+
+    result = finalize_submitted_order(order, allow_partial=False, kis_client=kis_client)
+    return {"finalized": 1 if result is not None else 0}
 
 
-def reconcile_order_executions(kis_client=None, lookback_days=1):
-    """After-close sweep: finalize every remaining pending (SUBMITTED) order.
+def finalize_orders(kis_client=None, lookback_days=1):
+    """After-close sweep: commit every remaining SUBMITTED order (one KIS call each).
 
     Once the market is closed no further fills can arrive, so each pending order
     is committed with its real fill — partial, or zero when nothing executed —
-    using KIS's actual quantity/price/amount. This is what keeps the ledger
-    honest: a partial buy debits only the cash that actually moved (no more
-    starvation), and an unfilled order is closed out with no ledger change.
+    so nothing stays pending (and reserving funds/shares) overnight. Caller must
+    gate on market hours.
     """
-    if get_global_control().market_open:
-        return {"skipped": "market_open"}
-    return _finalize_orders(
-        allow_partial=True, kis_client=kis_client, lookback_days=lookback_days
+    cutoff = timezone.now() - timedelta(days=lookback_days + 1)
+    orders = (
+        Order.objects.filter(
+            status=Order.StatusChoices.SUBMITTED,
+            kis_order_id__gt="",
+            created_at__gte=cutoff,
+        )
+        .select_related("monkey__account")
+        .order_by("created_at")
     )
+
+    finalized = 0
+
+    for order in orders:
+        try:
+            finalize_submitted_order(order, allow_partial=True, kis_client=kis_client)
+            finalized += 1
+
+        except (KisClientError, ValueError):
+            logger.exception("Failed to finalize order %s", order.id)
+
+    return {"finalized": finalized}
 
 
 def refresh_account_cache(account, kis_client=None):
@@ -862,6 +941,7 @@ def refresh_account_cache(account, kis_client=None):
             "earning_rate": balance["earning_rate"],
         },
     )
+
     return cache
 
 
@@ -901,8 +981,10 @@ def list_account_summaries():
     for account in active_mock_accounts():
         try:
             summaries.append(build_account_summary(account))
+
         except (KisClientError, ValueError):
             continue
+
     return summaries
 
 
@@ -920,6 +1002,7 @@ def unallocated_cash(account, kis_client=None):
         .aggregate(total=Sum("balance"))["total"]
         or 0
     )
+
     return kis_cash - allocated
 
 
@@ -958,6 +1041,7 @@ def derive_interval(haste, control):
     haste=1 → min (fastest), haste=0 → max (slowest)."""
     low = control.auto_create_min_interval_seconds
     high = control.auto_create_max_interval_seconds
+
     return round(low + (high - low) * (1 - haste))
 
 
@@ -966,6 +1050,7 @@ def _spawn_traits(parent_pool, rng):
     if len(parent_pool) >= 2:
         parent_a, parent_b = rng.sample(parent_pool, 2)
         return mate_traits(parent_a, parent_b, rng)
+
     return random_trait(rng), random_trait(rng)
 
 
@@ -976,10 +1061,12 @@ def create_monkeys(account, count, starting_balance, rng=None):
     bulk_create) so Monkey.save() fires and creates the per-monkey PeriodicTask."""
     rng = rng or random
     control = get_global_control()
+
     # Snapshot the parent pool (this account's alive monkeys) once so it's
     # deterministic for a given rng seed.
     parent_pool = list(_alive_monkeys().filter(account=account))
     monkeys = []
+
     for _ in range(count):
         haste, balls = _spawn_traits(parent_pool, rng)
         monkey = Monkey(
@@ -993,6 +1080,7 @@ def create_monkeys(account, count, starting_balance, rng=None):
         )
         monkey.save()
         monkeys.append(monkey)
+
     return monkeys
 
 
@@ -1032,33 +1120,10 @@ def auto_create_monkeys():
     return created
 
 
-def run_active_monkeys():
-    if not get_global_control().enabled:
-        return {"enabled": False, "orders": 0}
-
-    orders = []
-    active = (
-        Monkey.objects.filter(state=Monkey.State.ACTIVE, account__is_active=True)
-        .exclude(account__isnull=True)
-        .order_by("id")
-    )
-    for monkey in active:
-        try:
-            orders.append(run_random_monkey_order(monkey.id))
-        except Exception:
-            # One monkey's failure must not abort the whole batch.
-            logger.exception("run_random_monkey_order failed for monkey %s", monkey.id)
-    return {
-        "enabled": True,
-        "orders": len(orders),
-        "order_ids": [order.id for order in orders],
-    }
-
-
 def _pending_buy_reserve(monkey_id):
     """Cash earmarked by a monkey's accepted-but-unfilled (SUBMITTED) buy orders.
 
-    Each pending buy reserves its estimated cost (estimated_price × requested
+    Each pending buy reserves its estimated cost (estimated_price * requested
     quantity) until it executes — preventing a monkey from queueing more buys
     than its settled cash can fund while fills are still pending."""
     total = 0
@@ -1087,6 +1152,7 @@ def sellable_quantity(monkey_id, stock_id, held_quantity=None):
             .first()
             or 0
         )
+
     reserved = (
         Order.objects.filter(
             monkey_id=monkey_id,
@@ -1100,39 +1166,48 @@ def sellable_quantity(monkey_id, stock_id, held_quantity=None):
 
 
 def _buy_quantity(monkey, stock, kis_client=None):
-    """Shares to buy = floor(max_affordable × balls), using the cached price
+    """Shares to buy = floor(max_affordable * balls), using the cached price
     (falling back to a live fetch). Floored so the order never costs more than
     the monkey's *available* cash (settled balance minus pending-buy reserves).
     Returns 0 when nothing is affordable or the price can't be resolved — the
     caller then records a SKIPPED order."""
     price = stock.current_price
+
     if not price:
         try:
             client = kis_client or KisClient(monkey.account)
             price = client.get_stock_price(stock.ticker)
+
         except (KisClientError, ValueError):
             return 0
+
     if not price:
         return 0
+
     max_buyable = available_cash(monkey) // price
+
     if max_buyable <= 0:
         return 0
+
     return math.floor(max_buyable * monkey.balls)
 
 
 def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
     rng = rng or random
     monkey = Monkey.objects.select_related("account").get(pk=monkey_id)
+
     # Monkeys only ever trade on an active mock account. A monkey with no account
     # (orphaned) or whose account is gone/inactive simply can't trade.
     if kis_client is None:
         if monkey.account is None or not monkey.account.is_active:
             return None
         kis_client = KisClient(monkey.account)
+
     order_type = rng.choice([Order.OrderTypeChoices.BUY, Order.OrderTypeChoices.SELL])
 
     if order_type == Order.OrderTypeChoices.BUY:
         stock = Stock.objects.filter(is_active=True).order_by("?").first()
+
         if not stock:
             return Order.objects.create(
                 monkey=monkey,
@@ -1142,8 +1217,10 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 status=Order.StatusChoices.SKIPPED,
                 failure_reason="No stock is available.",
             )
+
         # Boldness (balls) sets the slice of affordable shares to buy.
         quantity = _buy_quantity(monkey, stock, kis_client)
+
         if quantity < 1:
             return Order.objects.create(
                 monkey=monkey,
@@ -1153,10 +1230,12 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 status=Order.StatusChoices.SKIPPED,
                 failure_reason="Affordable amount rounds to zero shares.",
             )
+
     else:
         # Only consider holdings with shares not already committed to a pending
         # sell, so the monkey can't sell the same shares twice while fills lag.
         holding = None
+
         for candidate in (
             Holding.objects.filter(monkey=monkey, quantity__gt=0)
             .select_related("stock")
@@ -1165,10 +1244,13 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
             if sellable_quantity(monkey.id, candidate.stock_id, candidate.quantity) > 0:
                 holding = candidate
                 break
+
         if not holding:
             stock = Stock.objects.order_by("?").first()
+
             if stock is None:
                 stock = _placeholder_stock()
+
             return Order.objects.create(
                 monkey=monkey,
                 stock=stock,
@@ -1177,8 +1259,10 @@ def run_random_monkey_order(monkey_id, kis_client=None, rng=None):
                 status=Order.StatusChoices.SKIPPED,
                 failure_reason="Monkey has no holdings to sell.",
             )
+
         stock = holding.stock
         sellable = sellable_quantity(monkey.id, holding.stock_id, holding.quantity)
+
         # Boldness sets the slice of the (uncommitted) holding to sell; ceil so a
         # 1-share holding still sells (and we never exceed what's sellable).
         quantity = min(math.ceil(sellable * monkey.balls), sellable)
@@ -1205,6 +1289,7 @@ def run_system_monkey_order(kis_client=None, rng=None):
     """
     rng = rng or random
     orders = []
+
     for account in active_mock_accounts():
         system_monkey = get_or_create_system_monkey(account)
         holdings = list(
@@ -1212,6 +1297,7 @@ def run_system_monkey_order(kis_client=None, rng=None):
                 "stock"
             )
         )
+
         # Only sell shares not already committed to a pending sell, so the system
         # monkey doesn't double-submit the same holding while a fill is in flight.
         sellable_holdings = [
@@ -1219,8 +1305,10 @@ def run_system_monkey_order(kis_client=None, rng=None):
             for h in holdings
             if (qty := sellable_quantity(system_monkey.id, h.stock_id, h.quantity)) > 0
         ]
+
         if not sellable_holdings:
             continue
+
         holding, quantity = rng.choice(sellable_holdings)
         order = submit_monkey_order(
             monkey_id=system_monkey.id,
@@ -1229,8 +1317,10 @@ def run_system_monkey_order(kis_client=None, rng=None):
             quantity=quantity,
             kis_client=kis_client or KisClient(account),
         )
+
         if order is not None:
             orders.append(order)
+
     return orders
 
 
@@ -1247,9 +1337,11 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     """
     monkey = Monkey.objects.select_related("account").get(pk=monkey_id)
     stock = Stock.objects.get(pk=stock_id)
+
     if kis_client is None:
         if monkey.account is None:
             return None
+
         kis_client = KisClient(monkey.account)
 
     order = Order.objects.create(
@@ -1265,6 +1357,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     if not estimated_price:
         try:
             estimated_price = kis_client.get_stock_price(stock.ticker)
+
         except (KisClientError, ValueError) as exc:
             return _fail_order(order, f"Could not fetch stock price: {exc}")
 
@@ -1280,6 +1373,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         and available_cash(monkey) < total_price
     ):
         return _fail_order(order, "Insufficient monkey balance.")
+
     if (
         order_type == Order.OrderTypeChoices.SELL
         and sellable_quantity(monkey_id, stock_id) < quantity
@@ -1293,6 +1387,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
             ticker=stock.ticker,
             quantity=quantity,
         )
+
     except KisClientError as exc:
         order.kis_request = {
             "ticker": stock.ticker,
@@ -1300,6 +1395,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
             "order_type": int(order_type),
         }
         order.save(update_fields=["kis_request", "updated_at"])
+
         return _fail_order(order, f"KIS order request failed: {exc}")
 
     order.kis_request = request_payload
@@ -1320,8 +1416,10 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
         "kis_order_id",
         "updated_at",
     ]
+
     if str(response_data.get("rt_cd")) != "0":
         order.save(update_fields=update_fields)
+
         return _fail_order(order, response_data.get("msg1") or "KIS rejected order.")
 
     # KIS accepted the order. Mark it SUBMITTED (awaiting fill); the ledger is
@@ -1329,6 +1427,7 @@ def submit_monkey_order(monkey_id, stock_id, order_type, quantity, kis_client=No
     # is also when the order is pushed to the live dashboard feed.
     order.status = Order.StatusChoices.SUBMITTED
     order.save(update_fields=["status", *update_fields])
+
     return order
 
 
@@ -1338,19 +1437,20 @@ def _apply_execution(
     """Apply a KIS-confirmed fill to the local ledger and mark the order EXECUTED.
 
     Moves cash by the *actual* executed amount (KIS's 총체결금액, not a rounded
-    qty×price) and the Holding by the *actual* executed quantity, inside a short
-    ``select_for_update()`` atomic block retried on transient DB locks. A zero
-    fill (halt / no volume) records EXECUTED with no ledger change — the reserve
-    is released simply because the order leaves the SUBMITTED state.
+    qty*price) and the Holding by the *actual* executed quantity inside a
+    ``select_for_update()`` atomic block. A zero fill (halt / no volume) records
+    EXECUTED with no ledger change — the reserve is released simply because the
+    order leaves the SUBMITTED state.
 
-    Idempotent: locking the order row at the start of each attempt ensures that if
-    two tasks (e.g. ``finalize_filled_orders`` and ``reconcile_order_executions``)
-    race on the same SUBMITTED order only one will apply the ledger change.
+    Idempotent: locking the order row first ensures a racing worker that already
+    applied the same fill sees status != SUBMITTED and bails without touching the
+    ledger.
     """
     order.executed_quantity = executed_quantity
     order.executed_price = executed_price or None
     order.status = Order.StatusChoices.EXECUTED
     update_fields = ["status", "executed_quantity", "executed_price", "updated_at"]
+
     if execution_detail:
         order.execution_detail = execution_detail
         update_fields.append("execution_detail")
@@ -1359,63 +1459,54 @@ def _apply_execution(
     stock_id = order.stock_id
     order_type = order.order_type
 
-    for attempt in range(3):
-        try:
-            with transaction.atomic():
-                # Lock the order row first; if another worker already applied this
-                # execution the status is no longer SUBMITTED — bail without touching
-                # the ledger so we never double-count holdings or cash.
-                locked = Order.objects.select_for_update().get(pk=order.pk)
-                if locked.status != Order.StatusChoices.SUBMITTED:
-                    return order
+    with transaction.atomic():
+        # Lock the order row first; if another worker already applied this
+        # execution the status is no longer SUBMITTED — bail without touching
+        # the ledger so we never double-count holdings or cash.
+        locked = Order.objects.select_for_update().get(pk=order.pk)
 
-                if executed_quantity > 0:
-                    monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
-                    if order_type == Order.OrderTypeChoices.BUY:
-                        monkey.balance -= executed_amount
-                        monkey.save(update_fields=["balance"])
-                        holding, _ = Holding.objects.select_for_update().get_or_create(
-                            monkey=monkey,
-                            stock_id=stock_id,
-                            defaults={"quantity": 0},
-                        )
-                        holding.quantity += executed_quantity
-                        holding.save(update_fields=["quantity"])
-                    else:
-                        # The system monkey never retains cash: its sale proceeds are
-                        # left in the account as unallocated funds, so skip the balance
-                        # credit and keep its balance at 0.
-                        if not monkey.is_system:
-                            monkey.balance += executed_amount
-                            monkey.save(update_fields=["balance"])
-                        holding = (
-                            Holding.objects.select_for_update()
-                            .filter(monkey=monkey, stock_id=stock_id)
-                            .first()
-                        )
-                        if holding:
-                            holding.quantity -= executed_quantity
-                            _save_holding(holding)
-
-                order.save(update_fields=update_fields)
-            # Ledger committed — push filled orders to the live dashboard feed.
-            if executed_quantity > 0:
-                from monkey import realtime
-
-                realtime.publish_order(order)
+        if locked.status != Order.StatusChoices.SUBMITTED:
             return order
-        except OperationalError:
-            logger.warning(
-                "DB lock applying order %s (attempt %d/3)", order.id, attempt + 1
-            )
-            time.sleep(0.2 * (attempt + 1))
 
-    logger.error(
-        "Order %s executed on KIS but local ledger update failed after retries; "
-        "holdings reconciliation will reconcile it.",
-        order.id,
-    )
-    order.save(update_fields=update_fields)
+        if executed_quantity > 0:
+            monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
+
+            if order_type == Order.OrderTypeChoices.BUY:
+                monkey.balance -= executed_amount
+                monkey.save(update_fields=["balance"])
+                holding, _ = Holding.objects.select_for_update().get_or_create(
+                    monkey=monkey,
+                    stock_id=stock_id,
+                    defaults={"quantity": 0},
+                )
+                holding.quantity += executed_quantity
+                holding.save(update_fields=["quantity"])
+
+            else:
+                # The system monkey never retains cash: its sale proceeds are
+                # left in the account as unallocated funds, so skip the balance
+                # credit and keep its balance at 0.
+                if not monkey.is_system:
+                    monkey.balance += executed_amount
+                    monkey.save(update_fields=["balance"])
+                holding = (
+                    Holding.objects.select_for_update()
+                    .filter(monkey=monkey, stock_id=stock_id)
+                    .first()
+                )
+
+                if holding:
+                    holding.quantity -= executed_quantity
+                    _save_holding(holding)
+
+        order.save(update_fields=update_fields)
+
+    # Ledger committed — push filled orders to the live dashboard feed.
+    if executed_quantity > 0:
+        from monkey import realtime
+
+        realtime.publish_order(order)
+
     return order
 
 
@@ -1423,6 +1514,7 @@ def _save_holding(holding):
     """Persist a holding's quantity, removing the row entirely once it hits zero."""
     if holding.quantity <= 0:
         holding.delete()
+
     else:
         holding.save(update_fields=["quantity"])
 
@@ -1431,6 +1523,7 @@ def _fail_order(order, reason):
     order.status = Order.StatusChoices.FAILED
     order.failure_reason = str(reason)
     order.save(update_fields=["status", "failure_reason", "updated_at"])
+
     return order
 
 
@@ -1439,11 +1532,12 @@ def _placeholder_stock(ticker="UNKNOWN"):
         market="UNKNOWN",
         ticker=ticker,
         defaults={
-            "name": "Unknown stock"
-            if ticker == "UNKNOWN"
-            else f"Unknown stock ({ticker})",
+            "name": (
+                "Unknown stock" if ticker == "UNKNOWN" else f"Unknown stock ({ticker})"
+            ),
         },
     )
+
     return stock
 
 
@@ -1460,6 +1554,7 @@ def get_or_create_system_monkey(account):
             "order_interval_seconds": 60,
         },
     )
+
     return monkey
 
 
@@ -1479,12 +1574,15 @@ def transfer_holdings_to_system_monkey(monkey, stock_ids=None):
 
     system_monkey = get_or_create_system_monkey(monkey.account)
     transferred = []
+
     with transaction.atomic():
         holdings = Holding.objects.select_for_update().filter(
             monkey=monkey, quantity__gt=0
         )
+
         if stock_ids is not None:
             holdings = holdings.filter(stock_id__in=stock_ids)
+
         for holding in list(holdings):
             dest, _ = Holding.objects.select_for_update().get_or_create(
                 monkey=system_monkey,
@@ -1497,6 +1595,7 @@ def transfer_holdings_to_system_monkey(monkey, stock_ids=None):
                 {"stock_id": holding.stock_id, "quantity": holding.quantity}
             )
             holding.delete()
+
     return transferred
 
 
@@ -1539,12 +1638,16 @@ def _executed_order_net(monkey_id, stock_id):
         .values("order_type")
         .annotate(total=Sum("executed_quantity"))
     )
+
     for row in rows:
         qty = row["total"] or 0
+
         if row["order_type"] == Order.OrderTypeChoices.BUY:
             net += qty
+
         else:
             net -= qty
+
     return net
 
 
@@ -1568,6 +1671,7 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
     )
     remaining = phantom_qty
     affected = []
+
     # Accumulate refunds per monkey so we apply them in one DB update each.
     monkey_refunds: dict[int, int] = {}
 
@@ -1575,29 +1679,37 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
         nonlocal remaining
         holding.quantity -= reduction
         _save_holding(holding)
+
         # Refund the current market value of the removed phantom shares. Using
         # current_price is an approximation — the exact buy price is buried in
         # FIFO order history — but it's fair (monkey "sells" the ghost at market).
         price = holding.stock.current_price or 0
+
         if price > 0:
             monkey_refunds[holding.monkey_id] = (
                 monkey_refunds.get(holding.monkey_id, 0) + reduction * price
             )
+
         remaining -= reduction
         affected.append({"holding_id": holding.id, "reduced_by": reduction})
 
     # Pass 1: demonstrable phantom — Holding above its own succeeded-order net.
     excesses = []
+
     for holding in holdings:
         excess = holding.quantity - max(
             0, _executed_order_net(holding.monkey_id, holding.stock_id)
         )
+
         if excess > 0:
             excesses.append((excess, holding))
+
     excesses.sort(key=lambda pair: pair[0], reverse=True)
+
     for excess, holding in excesses:
         if remaining <= 0:
             break
+
         _reduce(holding, min(remaining, excess))
 
     # Pass 2: fallback for any remainder (real drift), largest holding first.
@@ -1605,12 +1717,18 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
         for holding in sorted(holdings, key=lambda h: h.quantity, reverse=True):
             if remaining <= 0:
                 break
+
             if holding.quantity <= 0:
                 continue
+
             _reduce(holding, min(remaining, holding.quantity))
 
     for monkey_id, refund in monkey_refunds.items():
-        Monkey.objects.filter(id=monkey_id).update(balance=F("balance") + refund)
+        # System monkeys never retain cash — skip the phantom-share refund so
+        # their balance stays at zero.
+        Monkey.objects.filter(id=monkey_id, is_system=False).update(
+            balance=F("balance") + refund
+        )
 
     return {
         "ticker": ticker,
@@ -1629,10 +1747,12 @@ def reconcile_holdings(account, kis_client=None):
     match reality.
     """
     kis_client = kis_client or KisClient(account)
+
     # KIS reports holdings keyed by the 6-digit pdno, so join the local ledger on
     # Stock.short_code (last 6 digits) — tickers may carry a prefix (e.g. Q610039)
     # that the pdno omits, which would otherwise never match.
     real = kis_client.get_account_balance()["holdings"]
+
     local = dict(
         Holding.objects.filter(monkey__account=account, quantity__gt=0)
         .values("stock__short_code")
@@ -1642,11 +1762,14 @@ def reconcile_holdings(account, kis_client=None):
 
     absorbed = []
     clamped = []
+
     for code in set(real) | set(local):
         real_qty = real.get(code, 0)
         local_qty = local.get(code, 0)
+
         if real_qty > local_qty:
             absorbed.append(_absorb_excess(account, code, real_qty - local_qty))
+
         elif local_qty > real_qty:
             clamped.append(_clamp_phantom_holdings(account, code, local_qty - real_qty))
 
@@ -1659,41 +1782,42 @@ def run_daily_maintenance():
     holdings and hand off orphaned/delisted/dead-monkey holdings to the system
     monkey for gradual liquidation.
 
-    Skips entirely while the market is open so killing never happens during a
-    trading session (which would break the Monkey Index baseline/live-equity
-    comparison). Finalizing pending orders here — *before* the holdings
-    reconciliation — attributes each real fill to the right monkey first, so the
-    orphan/clamp sweep only ever sees genuine drift. DB-only moves plus KIS
-    *reads* (executions + account balance) — no sell orders are placed here.
+    Caller must gate on market hours — killing must never happen during a trading
+    session (would break the Monkey Index baseline/live-equity comparison).
+    Finalizing pending orders here — *before* the holdings reconciliation —
+    attributes each real fill to the right monkey first, so the orphan/clamp sweep
+    only ever sees genuine drift. DB-only moves plus KIS *reads* (executions +
+    account balance) — no sell orders are placed here.
     """
-    if get_global_control().market_open:
-        return {"skipped": "market_open"}
-
     # Commit every remaining pending (SUBMITTED) order from its real fill before
-    # anything inspects holdings, so the ledger matches reality going in. No
-    # kis_client → each active account is finalized against its own credentials.
-    finalized = _finalize_orders(allow_partial=True)
-
+    # anything inspects holdings, so the ledger matches reality going in.
+    finalized = finalize_orders()
     killed = kill_inactive_monkeys()
 
-    reconciliation = []
+    absorbed = 0
+    clamped = 0
+
     for account in active_mock_accounts():
         try:
-            reconciliation.append(
-                {"account_id": account.id, **reconcile_holdings(account)}
-            )
+            result = reconcile_holdings(account)
+            absorbed += len(result["absorbed"])
+            clamped += len(result["clamped"])
+
         except (KisClientError, ValueError):
             continue
 
     by_monkey = {}
+
     for holding in Holding.objects.filter(
         quantity__gt=0, stock__is_active=False
     ).select_related("monkey", "stock"):
         if holding.monkey.is_system:
             continue  # already on the system monkey; it will try to sell it off
+
         by_monkey.setdefault(holding.monkey, []).append(holding.stock_id)
 
     delisted_transfers = 0
+
     for monkey, stock_ids in by_monkey.items():
         transferred = transfer_holdings_to_system_monkey(monkey, stock_ids=stock_ids)
         delisted_transfers += len(transferred)
@@ -1701,14 +1825,16 @@ def run_daily_maintenance():
     # Sweep killed monkeys that still hold stock (safety net; kill_monkey already
     # transfers, but reconciliation may have re-attributed leaked positions).
     killed_transfers = 0
+
     for monkey in Monkey.objects.filter(state=Monkey.State.DEAD, is_system=False):
         transferred = transfer_holdings_to_system_monkey(monkey)
         killed_transfers += len(transferred)
 
     return {
-        "finalized": finalized,
+        "finalized": finalized["finalized"],
         "killed": killed,
-        "reconciliation": reconciliation,
+        "absorbed": absorbed,
+        "clamped": clamped,
         "delisted_transfers": delisted_transfers,
         "killed_transfers": killed_transfers,
     }
