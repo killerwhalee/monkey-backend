@@ -320,14 +320,6 @@ class MonkeyServiceTests(TestCase):
         self.assertEqual(order.kis_response["rt_cd"], "1")
         self.assertEqual(monkey.balance, 5000)
 
-    def test_global_kill_switch_prevents_scheduled_orders(self):
-        Monkey.objects.create(name="A", balance=5000, initial_balance=5000)
-
-        result = services.run_active_monkeys()
-
-        self.assertEqual(result["enabled"], False)
-        self.assertEqual(Order.objects.count(), 0)
-
     def test_random_buy_quantity_scales_with_balls(self):
         # balance 5000 / price 100 = 50 affordable; balls 0.4 → floor(50*0.4) = 20.
         monkey = Monkey.objects.create(
@@ -1114,7 +1106,7 @@ class MonkeyApiTests(APITestCase):
         self.client.force_authenticate(non_staff)
         response = self.client.post(
             reverse("global-monkey-control-run-task"),
-            {"task": "run_monkeys"},
+            {"task": "run_system_monkey"},
             format="json",
         )
         self.assertEqual(response.status_code, 403)
@@ -1505,12 +1497,6 @@ class ThreeGateControlTests(TestCase):
         self.assertFalse(control.holiday_enabled)
         self.assertTrue(control.time_enabled)
         self.assertFalse(control.enabled)
-
-    def test_holiday_gate_short_circuits_run_active_monkeys(self):
-        services.set_trading_enabled(True)
-        services.set_holiday_closed(True)
-        result = services.run_active_monkeys()
-        self.assertEqual(result, {"enabled": False, "orders": 0})
 
     def test_check_holiday_task_sets_holiday_gate(self):
         make_account()

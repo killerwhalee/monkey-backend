@@ -26,11 +26,6 @@ def get_stock_price(ticker):
 
 
 @shared_task
-def run_monkeys():
-    return services.run_active_monkeys()
-
-
-@shared_task
 def run_monkey(monkey_id):
     if not services.get_global_control().enabled:
         return {"enabled": False, "monkey_id": monkey_id}

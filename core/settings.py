@@ -109,7 +109,6 @@ CELERY_TASK_DEFAULT_QUEUE = "default"
 CELERY_TASK_ROUTES = {
     # Mock account (~1 req/s): orders and all mock-account maintenance
     "monkey.tasks.run_monkey": {"queue": "kis_orders"},
-    "monkey.tasks.run_monkeys": {"queue": "kis_orders"},
     "monkey.tasks.run_system_monkey": {"queue": "kis_orders"},
     "monkey.tasks.finalize_filled_orders": {"queue": "kis_orders"},
     "monkey.tasks.reconcile_executions": {"queue": "kis_orders"},
