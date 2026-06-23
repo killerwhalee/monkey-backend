@@ -363,6 +363,7 @@ class Monkey(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         super().save(*args, **kwargs)
+
         try:
             from django_celery_beat.models import (
                 IntervalSchedule,

@@ -304,6 +304,7 @@ class KisClient:
         ctx_fk = ""
         ctx_nk = ""
         tr_cont = ""
+
         for _ in range(50):  # hard cap so a malformed continuation can't loop forever
             response = self._execute(
                 "GET",
@@ -331,6 +332,7 @@ class KisClient:
                 },
             )
             data = response.json()
+
             for item in data.get("output1") or []:
                 odno = str(item.get("odno") or "").lstrip("0")
                 executed = int(item.get("tot_ccld_qty") or 0)
@@ -352,6 +354,7 @@ class KisClient:
             tr_cont = response.headers.get("tr_cont", "")
             if tr_cont not in ("F", "M"):
                 break
+
             ctx_fk = data.get("ctx_area_fk100", "")
             ctx_nk = data.get("ctx_area_nk100", "")
 
@@ -419,6 +422,7 @@ class KisClient:
         send = requests.post if method == "POST" else requests.get
         attempts = max(1, getattr(settings, "KIS_MAX_RETRIES", 0) + 1)
         last_error = None
+
         for attempt in range(attempts):
             kis_throttle(self.rate_limit_key, self.rate_limit_interval)
             try:
@@ -450,6 +454,7 @@ class KisClient:
                 )
             if attempt + 1 < attempts:
                 time.sleep(0.15)  # KIS guidance: brief term, then re-call
+
         raise last_error or KisClientError(f"KIS request failed: {url}")
 
     @staticmethod
