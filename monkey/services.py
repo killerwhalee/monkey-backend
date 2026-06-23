@@ -575,22 +575,17 @@ def _record_index_tick():
 
 
 def current_index_value():
-    """Latest recorded index value: today's last tick, else today's base_index,
-    else the cold-start base."""
-    today = timezone.localdate()
-    last_tick = (
-        MonkeyIndexTick.objects.filter(recorded_at__date=today)
-        .order_by("recorded_at")
-        .last()
-    )
+    """Latest recorded index value: the most recent tick — the live value during a
+    session, otherwise the last session's close. Falls back to a baseline /
+    cold-start base only when no tick has ever been recorded.
+
+    Using the globally newest tick (not a today-scoped one) is what keeps the
+    dashboard card from showing a stale value pre-open / on weekends / holidays,
+    when there is no tick or baseline for today yet."""
+    last_tick = MonkeyIndexTick.objects.order_by("recorded_at").last()
 
     if last_tick is not None:
         return last_tick.value
-
-    baseline = MonkeyIndexBaseline.objects.filter(date=today).first()
-
-    if baseline is not None:
-        return baseline.base_index
 
     last_baseline = MonkeyIndexBaseline.objects.order_by("date").last()
 
