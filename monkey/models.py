@@ -393,7 +393,7 @@ class Monkey(models.Model):
                         "enabled": enabled,
                         # Skip-the-tick: drop a queued order that waited too long
                         # rather than execute it stale and back up the queue.
-                        "expire_seconds": min(self.order_interval_seconds, 120),
+                        "expire_seconds": 300,
                     },
                 )
             else:
