@@ -1,10 +1,9 @@
 import logging
 import math
 import random
-import time
 from datetime import timedelta
 
-from django.db import OperationalError, transaction
+from django.db import transaction
 from django.db.models import F, Sum
 from django.utils import timezone
 
@@ -171,7 +170,7 @@ def sync_monkey_periodic_tasks():
             # Fully-filled orders only arrive while the market is open; no point
             # polling KIS executions after close (the after-close sweep handles
             # the rest), so disable this poll outside trading hours.
-            "monkey.finalize_filled_orders",
+            "monkey.finalize_order",
         ]
     ).update(enabled=market_open)
 
@@ -552,17 +551,14 @@ def capture_index_baseline(target_date=None):
     return baseline
 
 
-def record_index_tick():
-    """Sample the current Monkey Index value: ``base_index * (b / a)``. Gated on
-    the global kill switch (mirrors run_monkey) so each day's ticks form a clean
-    trading-session candle. Skips if today's baseline hasn't been captured yet."""
-    if not get_global_control().market_open:
-        return {"market_open": False}
-
+def _record_index_tick():
+    """Sample the current Monkey Index value: ``base_index * (b / a)``.
+    Skips if today's baseline hasn't been captured yet. Caller is responsible
+    for gating on market hours."""
     baseline = MonkeyIndexBaseline.objects.filter(date=timezone.localdate()).first()
 
     if baseline is None:
-        return {"enabled": True, "baseline": False}
+        return {"baseline": False}
 
     if baseline.base_equity:
         value = baseline.base_index * (_alive_equity() / baseline.base_equity)
@@ -575,7 +571,7 @@ def record_index_tick():
     from monkey import realtime
 
     realtime.publish_index_tick(value, tick.recorded_at)
-    return {"enabled": True, "tick_id": tick.id, "value": value}
+    return {"tick_id": tick.id, "value": value}
 
 
 def current_index_value():
@@ -745,13 +741,9 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
 def update_held_stock_prices(kis_client=None):
     """Refresh live prices for every stock currently held by any monkey.
 
-    Gated on the global switch like record_earning_ratio_tick so prices are only
-    polled during a live trading session. These prices feed holdings valuation,
-    average-price/earning-rate breakdowns, and equity metrics.
+    Caller is responsible for gating on market hours. These prices feed holdings
+    valuation, average-price/earning-rate breakdowns, and equity metrics.
     """
-    if not get_global_control().market_open:
-        return {"market_open": False}
-
     try:
         kis_client = kis_client or get_account_free_client()
 
@@ -791,7 +783,7 @@ def update_held_stock_prices(kis_client=None):
         except (KisClientError, ValueError):
             pass
 
-    tick = record_index_tick()
+    tick = _record_index_tick()
 
     return {
         "enabled": True,
@@ -832,106 +824,103 @@ def update_all_stock_prices(kis_client=None):
     return {"updated": updated, "failed": failed}
 
 
-def _finalize_orders(allow_partial, kis_client=None, lookback_days=1):
-    """Apply KIS fills to pending (SUBMITTED) orders, mutating the local ledger.
+def finalize_submitted_order(order, allow_partial, kis_client=None):
+    """Query KIS for one SUBMITTED order's fill and apply it (one KIS API call).
 
-    Polls each account's daily order-execution inquiry and, matching by KIS order
-    number (ODNO), applies each fill via ``_apply_execution`` with KIS's real
-    quantity, average price, and total amount.
+    ``allow_partial=False`` (mid-session): skip if not fully filled yet, leaving
+    the order SUBMITTED for a later pass.
+    ``allow_partial=True`` (after close): commit whatever filled — partial or zero
+    — so nothing stays pending overnight.
 
-    ``allow_partial=False`` (mid-session): finalize an order only once it is
-    FULLY filled (``executed_quantity >= requested_quantity``); leave partials
-    SUBMITTED so later fills in the same session accumulate before we commit.
-
-    ``allow_partial=True`` (after close): finalize EVERY remaining pending order
-    with whatever it filled — a partial, or zero when KIS shows no fill — so
-    nothing stays pending (and reserving funds/shares) overnight.
-
-    When ``kis_client`` is given it is used for *all* pending orders (the test
-    seam / single-account path); otherwise each active mock account is polled
-    with its own credentials and only its monkeys' orders are finalized.
+    Returns the updated order, or ``None`` when the order is skipped mid-session.
     """
-    start = timezone.localdate() - timedelta(days=lookback_days)
-    cutoff = timezone.now() - timedelta(days=lookback_days + 1)
+    if kis_client is None:
+        if order.monkey is None or order.monkey.account is None:
+            return None
+        kis_client = KisClient(order.monkey.account)
 
-    if kis_client is not None:
-        batches = [(None, kis_client)]
+    executions = kis_client.get_daily_order_executions(odno=order.kis_order_id)
+    fill = executions.get(order.kis_order_id.lstrip("0"))
+
+    executed_quantity = fill["executed_quantity"] if fill else 0
+    if not allow_partial and executed_quantity < order.requested_quantity:
+        return None
+
+    if fill:
+        executed_price = fill["avg_price"] or order.estimated_price
+        executed_amount = fill["executed_amount"] or (
+            executed_quantity * (executed_price or 0)
+        )
+        execution_detail = fill.get("raw") or {}
 
     else:
-        batches = [(account, KisClient(account)) for account in active_mock_accounts()]
+        executed_price = None
+        executed_amount = 0
+        execution_detail = {}
 
-    finalized = 0
-
-    for account, client in batches:
-        executions = client.get_daily_order_executions(start_date=start)
-        orders = Order.objects.filter(
-            status=Order.StatusChoices.SUBMITTED,
-            created_at__gte=cutoff,
-        )
-        if account is not None:
-            orders = orders.filter(monkey__account=account)
-
-        for order in orders:
-            fill = (
-                executions.get(order.kis_order_id.lstrip("0"))
-                if order.kis_order_id
-                else None
-            )
-
-            executed_quantity = fill["executed_quantity"] if fill else 0
-            if not allow_partial and executed_quantity < order.requested_quantity:
-                # Mid-session: not fully filled yet — leave it for later fills.
-                continue
-
-            if fill:
-                executed_price = fill["avg_price"] or order.estimated_price
-                executed_amount = fill["executed_amount"] or (
-                    executed_quantity * (executed_price or 0)
-                )
-                execution_detail = fill.get("raw") or {}
-
-            else:
-                executed_price = None
-                executed_amount = 0
-                execution_detail = {}
-
-            _apply_execution(
-                order,
-                executed_quantity,
-                executed_price,
-                executed_amount,
-                execution_detail=execution_detail,
-            )
-            finalized += 1
-
-    return {"finalized": finalized}
+    return _apply_execution(
+        order,
+        executed_quantity,
+        executed_price,
+        executed_amount,
+        execution_detail=execution_detail,
+    )
 
 
-def finalize_filled_orders(kis_client=None):
-    """Mid-session sweep: apply fully-filled pending orders to the ledger.
+def finalize_order(kis_client=None):
+    """Mid-session: finalize the oldest pending SUBMITTED order (one KIS call).
 
-    Most market orders fill within minutes, so running this on a short interval
-    surfaces the resulting holdings/cash promptly. Partially-filled orders are
-    left pending for the after-close sweep.
+    Caller must gate on market hours. Designed to be run very frequently so
+    SUBMITTED orders are picked up promptly without each invocation fetching
+    every account's full paginated execution list.
     """
-    return _finalize_orders(allow_partial=False, kis_client=kis_client)
+    order = (
+        Order.objects.filter(
+            status=Order.StatusChoices.SUBMITTED,
+            kis_order_id__gt="",
+        )
+        .select_related("monkey__account")
+        .order_by("created_at")
+        .first()
+    )
+
+    if order is None:
+        return {"finalized": 0}
+
+    result = finalize_submitted_order(order, allow_partial=False, kis_client=kis_client)
+    return {"finalized": 1 if result is not None else 0}
 
 
-def reconcile_order_executions(kis_client=None, lookback_days=1):
-    """After-close sweep: finalize every remaining pending (SUBMITTED) order.
+def finalize_orders(kis_client=None, lookback_days=1):
+    """After-close sweep: commit every remaining SUBMITTED order (one KIS call each).
 
     Once the market is closed no further fills can arrive, so each pending order
     is committed with its real fill — partial, or zero when nothing executed —
-    using KIS's actual quantity/price/amount. This is what keeps the ledger
-    honest: a partial buy debits only the cash that actually moved (no more
-    starvation), and an unfilled order is closed out with no ledger change.
+    so nothing stays pending (and reserving funds/shares) overnight. Caller must
+    gate on market hours.
     """
-    if get_global_control().market_open:
-        return {"skipped": "market_open"}
-
-    return _finalize_orders(
-        allow_partial=True, kis_client=kis_client, lookback_days=lookback_days
+    cutoff = timezone.now() - timedelta(days=lookback_days + 1)
+    orders = (
+        Order.objects.filter(
+            status=Order.StatusChoices.SUBMITTED,
+            kis_order_id__gt="",
+            created_at__gte=cutoff,
+        )
+        .select_related("monkey__account")
+        .order_by("created_at")
     )
+
+    finalized = 0
+
+    for order in orders:
+        try:
+            finalize_submitted_order(order, allow_partial=True, kis_client=kis_client)
+            finalized += 1
+
+        except (KisClientError, ValueError):
+            logger.exception("Failed to finalize order %s", order.id)
+
+    return {"finalized": finalized}
 
 
 def refresh_account_cache(account, kis_client=None):
@@ -1448,14 +1437,14 @@ def _apply_execution(
     """Apply a KIS-confirmed fill to the local ledger and mark the order EXECUTED.
 
     Moves cash by the *actual* executed amount (KIS's 총체결금액, not a rounded
-    qty*price) and the Holding by the *actual* executed quantity, inside a short
-    ``select_for_update()`` atomic block retried on transient DB locks. A zero
-    fill (halt / no volume) records EXECUTED with no ledger change — the reserve
-    is released simply because the order leaves the SUBMITTED state.
+    qty*price) and the Holding by the *actual* executed quantity inside a
+    ``select_for_update()`` atomic block. A zero fill (halt / no volume) records
+    EXECUTED with no ledger change — the reserve is released simply because the
+    order leaves the SUBMITTED state.
 
-    Idempotent: locking the order row at the start of each attempt ensures that if
-    two tasks (e.g. ``finalize_filled_orders`` and ``reconcile_order_executions``)
-    race on the same SUBMITTED order only one will apply the ledger change.
+    Idempotent: locking the order row first ensures a racing worker that already
+    applied the same fill sees status != SUBMITTED and bails without touching the
+    ledger.
     """
     order.executed_quantity = executed_quantity
     order.executed_price = executed_price or None
@@ -1470,70 +1459,53 @@ def _apply_execution(
     stock_id = order.stock_id
     order_type = order.order_type
 
-    for attempt in range(3):
-        try:
-            with transaction.atomic():
-                # Lock the order row first; if another worker already applied this
-                # execution the status is no longer SUBMITTED — bail without touching
-                # the ledger so we never double-count holdings or cash.
-                locked = Order.objects.select_for_update().get(pk=order.pk)
+    with transaction.atomic():
+        # Lock the order row first; if another worker already applied this
+        # execution the status is no longer SUBMITTED — bail without touching
+        # the ledger so we never double-count holdings or cash.
+        locked = Order.objects.select_for_update().get(pk=order.pk)
 
-                if locked.status != Order.StatusChoices.SUBMITTED:
-                    return order
-
-                if executed_quantity > 0:
-                    monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
-
-                    if order_type == Order.OrderTypeChoices.BUY:
-                        monkey.balance -= executed_amount
-                        monkey.save(update_fields=["balance"])
-                        holding, _ = Holding.objects.select_for_update().get_or_create(
-                            monkey=monkey,
-                            stock_id=stock_id,
-                            defaults={"quantity": 0},
-                        )
-                        holding.quantity += executed_quantity
-                        holding.save(update_fields=["quantity"])
-
-                    else:
-                        # The system monkey never retains cash: its sale proceeds are
-                        # left in the account as unallocated funds, so skip the balance
-                        # credit and keep its balance at 0.
-                        if not monkey.is_system:
-                            monkey.balance += executed_amount
-                            monkey.save(update_fields=["balance"])
-                        holding = (
-                            Holding.objects.select_for_update()
-                            .filter(monkey=monkey, stock_id=stock_id)
-                            .first()
-                        )
-
-                        if holding:
-                            holding.quantity -= executed_quantity
-                            _save_holding(holding)
-
-                order.save(update_fields=update_fields)
-
-            # Ledger committed — push filled orders to the live dashboard feed.
-            if executed_quantity > 0:
-                from monkey import realtime
-
-                realtime.publish_order(order)
-
+        if locked.status != Order.StatusChoices.SUBMITTED:
             return order
 
-        except OperationalError:
-            logger.warning(
-                "DB lock applying order %s (attempt %d/3)", order.id, attempt + 1
-            )
-            time.sleep(0.2 * (attempt + 1))
+        if executed_quantity > 0:
+            monkey = Monkey.objects.select_for_update().get(pk=monkey_id)
 
-    logger.error(
-        "Order %s executed on KIS but local ledger update failed after retries; "
-        "holdings reconciliation will reconcile it.",
-        order.id,
-    )
-    order.save(update_fields=update_fields)
+            if order_type == Order.OrderTypeChoices.BUY:
+                monkey.balance -= executed_amount
+                monkey.save(update_fields=["balance"])
+                holding, _ = Holding.objects.select_for_update().get_or_create(
+                    monkey=monkey,
+                    stock_id=stock_id,
+                    defaults={"quantity": 0},
+                )
+                holding.quantity += executed_quantity
+                holding.save(update_fields=["quantity"])
+
+            else:
+                # The system monkey never retains cash: its sale proceeds are
+                # left in the account as unallocated funds, so skip the balance
+                # credit and keep its balance at 0.
+                if not monkey.is_system:
+                    monkey.balance += executed_amount
+                    monkey.save(update_fields=["balance"])
+                holding = (
+                    Holding.objects.select_for_update()
+                    .filter(monkey=monkey, stock_id=stock_id)
+                    .first()
+                )
+
+                if holding:
+                    holding.quantity -= executed_quantity
+                    _save_holding(holding)
+
+        order.save(update_fields=update_fields)
+
+    # Ledger committed — push filled orders to the live dashboard feed.
+    if executed_quantity > 0:
+        from monkey import realtime
+
+        realtime.publish_order(order)
 
     return order
 
@@ -1752,7 +1724,11 @@ def _clamp_phantom_holdings(account, ticker, phantom_qty):
             _reduce(holding, min(remaining, holding.quantity))
 
     for monkey_id, refund in monkey_refunds.items():
-        Monkey.objects.filter(id=monkey_id).update(balance=F("balance") + refund)
+        # System monkeys never retain cash — skip the phantom-share refund so
+        # their balance stays at zero.
+        Monkey.objects.filter(id=monkey_id, is_system=False).update(
+            balance=F("balance") + refund
+        )
 
     return {
         "ticker": ticker,
@@ -1806,29 +1782,26 @@ def run_daily_maintenance():
     holdings and hand off orphaned/delisted/dead-monkey holdings to the system
     monkey for gradual liquidation.
 
-    Skips entirely while the market is open so killing never happens during a
-    trading session (which would break the Monkey Index baseline/live-equity
-    comparison). Finalizing pending orders here — *before* the holdings
-    reconciliation — attributes each real fill to the right monkey first, so the
-    orphan/clamp sweep only ever sees genuine drift. DB-only moves plus KIS
-    *reads* (executions + account balance) — no sell orders are placed here.
+    Caller must gate on market hours — killing must never happen during a trading
+    session (would break the Monkey Index baseline/live-equity comparison).
+    Finalizing pending orders here — *before* the holdings reconciliation —
+    attributes each real fill to the right monkey first, so the orphan/clamp sweep
+    only ever sees genuine drift. DB-only moves plus KIS *reads* (executions +
+    account balance) — no sell orders are placed here.
     """
-    if get_global_control().market_open:
-        return {"skipped": "market_open"}
-
     # Commit every remaining pending (SUBMITTED) order from its real fill before
-    # anything inspects holdings, so the ledger matches reality going in. No
-    # kis_client → each active account is finalized against its own credentials.
-    finalized = _finalize_orders(allow_partial=True)
+    # anything inspects holdings, so the ledger matches reality going in.
+    finalized = finalize_orders()
     killed = kill_inactive_monkeys()
 
-    reconciliation = []
+    absorbed = 0
+    clamped = 0
 
     for account in active_mock_accounts():
         try:
-            reconciliation.append(
-                {"account_id": account.id, **reconcile_holdings(account)}
-            )
+            result = reconcile_holdings(account)
+            absorbed += len(result["absorbed"])
+            clamped += len(result["clamped"])
 
         except (KisClientError, ValueError):
             continue
@@ -1858,9 +1831,10 @@ def run_daily_maintenance():
         killed_transfers += len(transferred)
 
     return {
-        "finalized": finalized,
+        "finalized": finalized["finalized"],
         "killed": killed,
-        "reconciliation": reconciliation,
+        "absorbed": absorbed,
+        "clamped": clamped,
         "delisted_transfers": delisted_transfers,
         "killed_transfers": killed_transfers,
     }
