@@ -93,25 +93,22 @@ CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 
 CELERY_TASK_DEFAULT_QUEUE = "default"
 
-# Group tasks by traffic/timing. Every KIS-touching task shares the one global
-# rate limiter (see monkey.kis); the queues exist for isolation/prioritization,
-# not parallelism (KIS paper trading caps requests at ~1/sec per account).
+# All KIS-touching tasks share a single queue drained by one concurrency-1 worker.
+# This prevents maintenance tasks (finalize_filled_orders, update_held_stock_prices)
+# from starving behind the per-account Redis rate limiter when a second worker
+# monopolises it with order tasks. single_instance() prevents pile-up within the queue.
 CELERY_TASK_ROUTES = {
-    # market-open, very high traffic
     "monkey.tasks.run_monkey": {"queue": "kis_orders"},
     "monkey.tasks.run_monkeys": {"queue": "kis_orders"},
     "monkey.tasks.get_stock_price": {"queue": "kis_orders"},
-    # market-open, low traffic but important
-    "monkey.tasks.update_held_stock_prices": {"queue": "kis_maintenance"},
-    "monkey.tasks.finalize_filled_orders": {"queue": "kis_maintenance"},
-    # runs while the market is closed
-    "monkey.tasks.reconcile_executions": {"queue": "kis_offhours"},
-    "monkey.tasks.update_token": {"queue": "kis_offhours"},
-    "monkey.tasks.check_holiday": {"queue": "kis_offhours"},
-    "monkey.tasks.auto_create_monkeys": {"queue": "kis_offhours"},
-    # Cull + reconcile/transfer (one KIS read + DB moves, no orders), runs while
-    # the market is closed — on the always-on default queue so on-demand/off-hours
-    # runs are actually consumed. Its lone KIS read is throttled by the global limiter.
+    "monkey.tasks.update_held_stock_prices": {"queue": "kis_orders"},
+    "monkey.tasks.finalize_filled_orders": {"queue": "kis_orders"},
+    "monkey.tasks.reconcile_executions": {"queue": "kis_orders"},
+    "monkey.tasks.update_token": {"queue": "kis_orders"},
+    "monkey.tasks.check_holiday": {"queue": "kis_orders"},
+    "monkey.tasks.auto_create_monkeys": {"queue": "kis_orders"},
+    # Non-KIS: cull + snapshot + index baseline. On the always-on default queue so
+    # on-demand and off-hours runs are consumed without touching the KIS worker.
     "monkey.tasks.daily_maintenance": {"queue": "default"},
 }
 
