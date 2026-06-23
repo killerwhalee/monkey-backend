@@ -880,12 +880,20 @@ def finalize_order(kis_client=None):
             kis_order_id__gt="",
         )
         .select_related("monkey__account")
-        .order_by("created_at")
+        .order_by(
+            F("last_finalize_check").asc(nulls_first=True),
+            "created_at",
+        )
         .first()
     )
 
     if order is None:
         return {"finalized": 0}
+
+    # Stamp the attempt up front so a perpetually-partial order (e.g. a thin,
+    # low-volume stock that never fully fills) rotates to the back of the queue
+    # instead of monopolizing the head and starving every newer SUBMITTED order.
+    Order.objects.filter(pk=order.pk).update(last_finalize_check=timezone.now())
 
     result = finalize_submitted_order(order, allow_partial=False, kis_client=kis_client)
     return {"finalized": 1 if result is not None else 0}

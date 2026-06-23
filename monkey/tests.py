@@ -1722,6 +1722,44 @@ class ExecutionReconciliationTests(TestCase):
         # Reserve released now that the order left the pending state.
         self.assertEqual(services.available_cash(monkey), 5000)
 
+    def test_perpetually_partial_head_does_not_starve_newer_order(self):
+        # A thin-stock order that only ever partially fills must not monopolize the
+        # head of the finalize queue: finalize_order rotates past it (round-robin on
+        # last_finalize_check) so a newer, fully-filled order still settles.
+        monkey = Monkey.objects.create(name="RR", balance=50000, initial_balance=50000)
+        services.set_trading_enabled(True)
+        client = FakeKisClient(price=1000)
+
+        # Oldest order: a thin stock that never fully fills (4 of 10).
+        thin = services.submit_monkey_order(
+            monkey.id, self.stock.id, Order.OrderTypeChoices.BUY, 10, kis_client=client
+        )
+        # Newer order on a second stock that fills completely.
+        other_stock = Stock.objects.create(
+            market="KOSPI", ticker="000660", name="SK hynix"
+        )
+        full = services.submit_monkey_order(
+            monkey.id, other_stock.id, Order.OrderTypeChoices.BUY, 2, kis_client=client
+        )
+        client.fill(thin, quantity=4, avg_price=1000, amount=4000)
+        client.fill(full, quantity=2, avg_price=1000, amount=2000)
+
+        # First pass picks the oldest (thin) order; it's partial, so it stays
+        # SUBMITTED but its check timestamp advances to the back of the queue.
+        services.finalize_order(kis_client=client)
+        thin.refresh_from_db()
+        full.refresh_from_db()
+        self.assertEqual(thin.status, Order.StatusChoices.SUBMITTED)
+        self.assertIsNotNone(thin.last_finalize_check)
+        self.assertEqual(full.status, Order.StatusChoices.SUBMITTED)
+
+        # Second pass now reaches the newer, fully-filled order and settles it,
+        # rather than re-parking on the perpetually-partial head.
+        services.finalize_order(kis_client=client)
+        full.refresh_from_db()
+        self.assertEqual(full.status, Order.StatusChoices.EXECUTED)
+        self.assertEqual(full.executed_quantity, 2)
+
     def test_pending_buy_blocks_overspending(self):
         # A monkey can't queue a second buy beyond its available (reserved) cash.
         monkey = Monkey.objects.create(name="O", balance=3000, initial_balance=3000)
