@@ -1410,6 +1410,32 @@ class DashboardSummaryApiTests(APITestCase):
             ),
         )
 
+    def test_dashboard_summary_uses_last_tick_when_today_has_none(self):
+        # Pre-open / weekend / holiday: no tick or baseline for today yet. The card
+        # must show the last real close (the most recent tick), not a stale
+        # two-sessions-ago baseline.base_index.
+        from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
+
+        today = timezone.localdate()
+        # An older baseline whose base_index is the close from two sessions ago.
+        MonkeyIndexBaseline.objects.create(
+            date=today - timedelta(days=2), base_index=9000.0, base_equity=9000
+        )
+        # Yesterday's close, recorded as the most recent tick (auto_now_add stamps
+        # "now", so backdate it explicitly).
+        tick = MonkeyIndexTick.objects.create(value=11000.0)
+        MonkeyIndexTick.objects.filter(pk=tick.pk).update(
+            recorded_at=timezone.now() - timedelta(days=1)
+        )
+
+        response = self.client.get(reverse("dashboard-summary"))
+
+        self.assertEqual(response.status_code, 200)
+        # Last recorded value (yesterday's close), not the stale 9,000 baseline.
+        self.assertAlmostEqual(response.data["monkey_index"], 11000.0)
+        # No baseline for today → change is flat vs "open".
+        self.assertEqual(response.data["monkey_index_change"], 0.0)
+
 
 class JWTAuthTests(APITestCase):
     def test_admin_can_obtain_and_use_jwt(self):
