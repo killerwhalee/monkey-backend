@@ -29,7 +29,8 @@ jobs:
             # the sqlite file. `set -e` aborts the deploy if the backup fails, so the
             # irreversible migration never runs unprotected.
             DB_URL="$(grep -E '^DJANGO_DATABASE=' .env | head -n1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
-            pg_dump --no-owner "$DB_URL" > "$HOME/monkey-db.bak.$(date +%F-%H%M%S).sql"
+            mkdir -p "$HOME/monkey/backend/_backups"
+            pg_dump --no-owner "$DB_URL" > "$HOME/monkey/backend/_backups/monkey-db.bak.$(date +%F-%H%M%S).sql"
             uv run python manage.py migrate --noinput
             uv run python manage.py collectstatic --noinput
             sudo systemctl restart monkey.target

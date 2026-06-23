@@ -216,6 +216,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Project: logs and collected static
+# Project: logs, collected static, and CI DB backups
 _logs/
 _static/
+_backups/
