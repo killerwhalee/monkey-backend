@@ -78,6 +78,8 @@ def snapshot_monkeys():
 
 @shared_task
 def daily_maintenance():
+    if services.get_global_control().market_open:
+        return {"skipped": "market_open"}
     return services.run_daily_maintenance()
 
 
@@ -90,14 +92,11 @@ def auto_create_monkeys():
 
 
 @shared_task
-def record_index_tick():
-    return services.record_index_tick()
-
-
-@shared_task
 def update_held_stock_prices():
+    if not services.get_global_control().market_open:
+        return {"market_open": False}
     # Skip if a previous run is still draining the (rate-limited) KIS budget, so
-    # beat-scheduled instances can't pile up on the kis_orders queue.
+    # beat-scheduled instances can't pile up on the kis_prices queue.
     with single_instance("update_held_stock_prices", ttl=300) as acquired:
         if not acquired:
             return {"skipped": "already_running"}
@@ -110,15 +109,17 @@ def update_all_stock_prices():
 
 
 @shared_task
-def finalize_filled_orders():
+def finalize_order():
     if not services.get_global_control().market_open:
         return {"market_open": False}
-    with single_instance("finalize_filled_orders", ttl=300) as acquired:
+    with single_instance("finalize_order", ttl=300) as acquired:
         if not acquired:
             return {"skipped": "already_running"}
-        return services.finalize_filled_orders()
+        return services.finalize_order()
 
 
 @shared_task
-def reconcile_executions():
-    return services.reconcile_order_executions()
+def finalize_orders():
+    if services.get_global_control().market_open:
+        return {"skipped": "market_open"}
+    return services.finalize_orders()

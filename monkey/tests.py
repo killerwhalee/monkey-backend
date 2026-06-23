@@ -93,7 +93,10 @@ class FakeKisClient:
     def is_holiday(self, date=None):
         return self.holiday
 
-    def get_daily_order_executions(self, start_date=None, end_date=None):
+    def get_daily_order_executions(self, start_date=None, end_date=None, odno=None):
+        if odno:
+            key = odno.lstrip("0")
+            return {k: v for k, v in self.executions.items() if k == key}
         return self.executions
 
     def order_stock(self, order_type, ticker, quantity):
@@ -146,7 +149,7 @@ def execute_order(client, order, *, quantity=None, avg_price=None, amount=None):
     """Test helper: fill ``order`` on ``client`` and finalize it (SUBMITTED →
     EXECUTED), returning the refreshed order."""
     client.fill(order, quantity=quantity, avg_price=avg_price, amount=amount)
-    services.finalize_filled_orders(kis_client=client)
+    services.finalize_submitted_order(order, allow_partial=True, kis_client=client)
     order.refresh_from_db()
     return order
 
@@ -741,10 +744,11 @@ class OrphanedHoldingsTests(TestCase):
         services.set_trading_enabled(True)
         loser = self._monkey(name="L", balance=0, initial_balance=1000)
 
-        with mock.patch("monkey.services.KisClient", return_value=FakeKisClient()):
-            result = services.run_daily_maintenance()
+        from monkey.tasks import daily_maintenance
 
-        self.assertEqual(result, {"skipped": "market_open"})
+        result = daily_maintenance()
+
+        self.assertEqual(result["output"], {"skipped": "market_open"})
         loser.refresh_from_db()
         self.assertEqual(loser.state, Monkey.State.ACTIVE)
 
@@ -1199,7 +1203,7 @@ class TaskScheduleApiTests(APITestCase):
         names = [row["name"] for row in response.data]
         self.assertNotIn("monkey.run.999", names)
         self.assertIn("monkey.update_held_stock_prices", names)
-        self.assertIn("monkey.finalize_filled_orders", names)
+        self.assertIn("monkey.finalize_order", names)
         # Ascending by cadence.
         everys = [row["every"] for row in response.data]
         self.assertEqual(everys, sorted(everys))
@@ -1579,17 +1583,11 @@ class HoldingsBreakdownTests(TestCase):
 
     def test_update_held_stock_prices_writes_live_price(self):
         Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=2)
-        services.set_trading_enabled(True)
         result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
         self.stock.refresh_from_db()
         self.assertEqual(result["updated"], 1)
         self.assertEqual(self.stock.current_price, 4321)
         self.assertIsNotNone(self.stock.price_updated_at)
-
-    def test_update_held_stock_prices_gated_on_global_switch(self):
-        Holding.objects.create(monkey=self.monkey, stock=self.stock, quantity=2)
-        result = services.update_held_stock_prices(kis_client=FakeKisClient(price=4321))
-        self.assertEqual(result, {"market_open": False})
 
     def test_update_all_stock_prices_prices_every_active_stock(self):
         # self.stock is active and unheld; another active stock and a delisted one.
@@ -1645,7 +1643,7 @@ class ExecutionReconciliationTests(TestCase):
             }
         )
         with mock.patch("monkey.services.KisClient", return_value=client):
-            result = services.reconcile_order_executions()
+            result = services.finalize_orders()
 
         order.refresh_from_db()
         self.monkey.refresh_from_db()
@@ -1677,7 +1675,7 @@ class ExecutionReconciliationTests(TestCase):
 
         # Mid-session: only a partial fill is reported — the order stays pending.
         client.fill(order, quantity=4, avg_price=1000, amount=4000)
-        services.finalize_filled_orders(kis_client=client)
+        services.finalize_order(kis_client=client)
         order.refresh_from_db()
         self.assertEqual(order.status, Order.StatusChoices.SUBMITTED)
         monkey.refresh_from_db()
@@ -1685,7 +1683,7 @@ class ExecutionReconciliationTests(TestCase):
 
         # After close: the partial is committed and the unfilled reserve is freed.
         services.set_trading_enabled(False)
-        result = services.reconcile_order_executions(kis_client=client)
+        result = services.finalize_orders(kis_client=client)
         order.refresh_from_db()
         monkey.refresh_from_db()
         self.assertEqual(result["finalized"], 1)
@@ -1712,7 +1710,7 @@ class ExecutionReconciliationTests(TestCase):
         )
         # No fill registered on the client at all.
         services.set_trading_enabled(False)
-        result = services.reconcile_order_executions(kis_client=client)
+        result = services.finalize_orders(kis_client=client)
 
         order.refresh_from_db()
         monkey.refresh_from_db()
@@ -1741,12 +1739,6 @@ class ExecutionReconciliationTests(TestCase):
         )
         self.assertEqual(second.status, Order.StatusChoices.FAILED)
         self.assertIn("Insufficient monkey balance", second.failure_reason)
-
-    def test_reconcile_gated_on_global_switch(self):
-        # The after-close finalize skips while the market is open.
-        services.set_trading_enabled(True)
-        result = services.reconcile_order_executions()
-        self.assertEqual(result, {"skipped": "market_open"})
 
 
 class CandlestickApiTests(APITestCase):
@@ -1890,27 +1882,19 @@ class MonkeyIndexTests(TestCase):
 
         self.assertEqual(baseline.base_index, 10500.0)
 
-    def test_record_tick_is_gated(self):
-        services.set_trading_enabled(False)
-        self.assertEqual(services.record_index_tick(), {"market_open": False})
-
     def test_record_tick_skips_without_baseline(self):
-        services.set_trading_enabled(True)
-        self.assertEqual(
-            services.record_index_tick(), {"enabled": True, "baseline": False}
-        )
+        self.assertEqual(services._record_index_tick(), {"baseline": False})
 
     def test_record_tick_scales_index_by_equity_ratio(self):
         from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
 
-        services.set_trading_enabled(True)
         # Alive equity now is 12,000; baseline a=10,000, i=10,000 → 10,000 * 1.2.
         Monkey.objects.create(name="A", balance=12000, initial_balance=10000)
         MonkeyIndexBaseline.objects.create(
             date=timezone.localdate(), base_index=10000.0, base_equity=10000
         )
 
-        result = services.record_index_tick()
+        result = services._record_index_tick()
 
         self.assertAlmostEqual(result["value"], 12000.0)
         self.assertAlmostEqual(
@@ -1920,12 +1904,11 @@ class MonkeyIndexTests(TestCase):
     def test_record_tick_flat_when_base_equity_zero(self):
         from monkey.models import MonkeyIndexBaseline
 
-        services.set_trading_enabled(True)
         MonkeyIndexBaseline.objects.create(
             date=timezone.localdate(), base_index=10000.0, base_equity=0
         )
 
-        result = services.record_index_tick()
+        result = services._record_index_tick()
 
         self.assertAlmostEqual(result["value"], 10000.0)
 
@@ -1986,7 +1969,7 @@ class MonkeyStateLifecycleTests(TestCase):
         market_hours_tasks = [
             "monkey.update_held_stock_prices",
             "monkey.run_system",
-            "monkey.finalize_filled_orders",
+            "monkey.finalize_order",
         ]
 
         services.set_trading_enabled(True)
@@ -2221,11 +2204,6 @@ class AccountCacheTests(TestCase):
         cache = KisAccountCache.objects.get(account=self.account)
         self.assertEqual(cache.cash_balance, 600_000)
         self.assertEqual(cache.total_assets, 750_000)
-
-    def test_update_held_stock_prices_skips_cache_when_market_closed(self):
-        result = services.update_held_stock_prices(kis_client=FakeKisClient())
-        self.assertEqual(result, {"market_open": False})
-        self.assertFalse(KisAccountCache.objects.exists())
 
 
 class SystemMonkeyVisibilityTests(APITestCase):
@@ -2557,13 +2535,11 @@ class SingleInstanceLockTests(TestCase):
     def test_skips_when_lock_already_held(self):
         # A second concurrent run gets nothing (SET NX returns False) → skips.
         from monkey import tasks
-        from monkey.kis import single_instance
 
+        services.set_trading_enabled(True)
         fake_redis = mock.Mock()
         fake_redis.set.return_value = False
         with mock.patch("monkey.kis._get_redis", return_value=fake_redis):
-            with single_instance("x", ttl=10) as acquired:
-                self.assertFalse(acquired)
             # BaseTask wraps the return value in a {"output": ...} envelope.
             result = tasks.update_held_stock_prices()
         self.assertEqual(result["output"], {"skipped": "already_running"})
