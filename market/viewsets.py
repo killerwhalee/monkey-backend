@@ -1,6 +1,19 @@
-from rest_framework import permissions, viewsets
+from rest_framework import pagination, permissions, viewsets
 
 from market import models, serializers
+
+
+class OrderPagination(pagination.PageNumberPagination):
+    """Cap the append-only Order ledger, which grows without bound.
+
+    Without this, an unfiltered ``GET /api/orders/`` serializes the entire
+    ledger (tens of MB) in a single response. Clients that need a full
+    per-monkey history page through via ``?page=`` / ``?monkey=``.
+    """
+
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 1000
 
 
 class IsAdminOrReadOnly(permissions.BasePermission):
@@ -35,4 +48,5 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     )
     serializer_class = serializers.OrderSerializer
     permission_classes = [permissions.AllowAny]
+    pagination_class = OrderPagination
     filterset_fields = ["monkey", "stock", "status", "order_type"]
