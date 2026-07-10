@@ -43,6 +43,19 @@ CORS_ALLOW_CREDENTIALS = env.bool(
     default=True,
 )
 
+# HTTPS / cookie hardening. nginx terminates TLS and forwards X-Forwarded-Proto,
+# so trust it for request.is_secure(). Strict flags only apply in production
+# (DEBUG off) so local dev over plain HTTP keeps working.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
 
 # Application definition
 
@@ -374,6 +387,12 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "feedback-create": "5/hour",
     },
+    # JSON only in production; the interactive browsable API (and its heavy HTML
+    # rendering of large list endpoints) is kept for local dev convenience only.
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+        *(["rest_framework.renderers.BrowsableAPIRenderer"] if DEBUG else []),
+    ],
 }
 
 
