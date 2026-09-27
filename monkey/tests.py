@@ -1828,6 +1828,19 @@ class CandlestickApiTests(APITestCase):
         self.assertEqual(candle["low"], 10100.0)
         self.assertEqual(candle["close"], 10200.0)
         self.assertIn("time", candle)
+        self.assertIsNone(candle["prev_close"])  # no baseline for the day
+
+    def test_candles_carry_their_days_prev_close(self):
+        from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
+
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=1000
+        )
+        MonkeyIndexTick.objects.create(value=10100.0)
+
+        for unit in ("1t", "15m", "1d"):
+            candle = services.build_index_candlesticks(unit=unit)[-1]
+            self.assertEqual(candle["prev_close"], 10000.0, unit)
 
     def test_intraday_buckets_are_shifted_to_kst(self):
         from monkey.models import MonkeyIndexTick

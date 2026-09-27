@@ -677,7 +677,16 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
 
     ``before`` is an exclusive upper bound on the candle ``time``: only candles
     strictly older than it are returned. With ``limit`` this paginates backwards.
+
+    Each candle also carries ``prev_close``: its trading day's ``base_index``
+    (the previous session's close), the reference for the day's change rate.
+    ``None`` when that day has no baseline.
     """
+    prev_closes = dict(MonkeyIndexBaseline.objects.values_list("date", "base_index"))
+
+    def prev_close_for(recorded_at):
+        return prev_closes.get(timezone.localtime(recorded_at).date())
+
     if unit == "1t":
         rows = list(
             MonkeyIndexTick.objects.order_by("recorded_at").values_list(
@@ -691,6 +700,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
                 "high": value,
                 "low": value,
                 "close": value,
+                "prev_close": prev_close_for(recorded_at),
             }
             for recorded_at, value in rows
         ]
@@ -702,6 +712,9 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
 
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
     buckets = {}
+    # Every unit's bucket lies within one KST day, so the first tick's day
+    # determines the whole bucket's prev_close.
+    bucket_prev_close = {}
     for recorded_at, value in MonkeyIndexTick.objects.order_by(
         "recorded_at"
     ).values_list("recorded_at", "value"):
@@ -715,6 +728,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             bucket = ts - (ts % seconds)
 
         buckets.setdefault(bucket, []).append(value)
+        bucket_prev_close.setdefault(bucket, prev_close_for(recorded_at))
 
     candlesticks = [
         {
@@ -723,6 +737,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             "high": max(values),
             "low": min(values),
             "close": values[-1],
+            "prev_close": bucket_prev_close[bucket],
         }
         for bucket, values in sorted(buckets.items())
     ]
