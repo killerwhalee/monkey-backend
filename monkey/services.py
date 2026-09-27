@@ -380,8 +380,25 @@ def set_interval_schedule(task_id, every):
     return _serialize_interval_schedule(task)
 
 
-class KillNotAllowedError(Exception):
-    """Raised when a monkey can't be killed because its holdings can't be liquidated."""
+class MarketOpenError(Exception):
+    """Raised when an admin action would change the alive-monkey set (or its
+    equity) while the market is open."""
+
+
+def ensure_market_closed(action: str) -> None:
+    """Reject admin actions that add/remove alive monkeys or move their cash
+    mid-session.
+
+    The Monkey Index is ``base_index * (b / a)`` where ``a`` is the alive equity
+    captured at open; creating/killing a monkey or editing its balance intraday
+    shifts ``b`` without any trade and makes the index jump. Off-hours changes
+    are safe because the next open re-captures ``a``.
+    """
+    if get_global_control().market_open:
+        raise MarketOpenError(
+            f"장중에는 원숭이를 {action}할 수 없습니다. "
+            "원숭이 지수 왜곡을 막기 위해 장 마감 후에 시도해 주세요."
+        )
 
 
 def kill_monkey(monkey: Monkey) -> Monkey:
@@ -677,7 +694,16 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
 
     ``before`` is an exclusive upper bound on the candle ``time``: only candles
     strictly older than it are returned. With ``limit`` this paginates backwards.
+
+    Each candle also carries ``prev_close``: its trading day's ``base_index``
+    (the previous session's close), the reference for the day's change rate.
+    ``None`` when that day has no baseline.
     """
+    prev_closes = dict(MonkeyIndexBaseline.objects.values_list("date", "base_index"))
+
+    def prev_close_for(recorded_at):
+        return prev_closes.get(timezone.localtime(recorded_at).date())
+
     if unit == "1t":
         rows = list(
             MonkeyIndexTick.objects.order_by("recorded_at").values_list(
@@ -691,6 +717,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
                 "high": value,
                 "low": value,
                 "close": value,
+                "prev_close": prev_close_for(recorded_at),
             }
             for recorded_at, value in rows
         ]
@@ -702,6 +729,9 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
 
     seconds = CANDLE_UNIT_SECONDS.get(unit, CANDLE_UNIT_SECONDS["1d"])
     buckets = {}
+    # Every unit's bucket lies within one KST day, so the first tick's day
+    # determines the whole bucket's prev_close.
+    bucket_prev_close = {}
     for recorded_at, value in MonkeyIndexTick.objects.order_by(
         "recorded_at"
     ).values_list("recorded_at", "value"):
@@ -715,6 +745,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             bucket = ts - (ts % seconds)
 
         buckets.setdefault(bucket, []).append(value)
+        bucket_prev_close.setdefault(bucket, prev_close_for(recorded_at))
 
     candlesticks = [
         {
@@ -723,6 +754,7 @@ def build_index_candlesticks(unit="1d", limit=120, before=None):
             "high": max(values),
             "low": min(values),
             "close": values[-1],
+            "prev_close": bucket_prev_close[bucket],
         }
         for bucket, values in sorted(buckets.items())
     ]
@@ -1091,8 +1123,10 @@ def create_monkeys_checked(account, count, starting_balance, kis_client=None):
     """Create monkeys on ``account`` only if it has enough unallocated cash.
 
     Used by the admin bulk-create path; raises ``InsufficientCashError`` instead
-    of silently over-allocating beyond the real account balance.
+    of silently over-allocating beyond the real account balance, and
+    ``MarketOpenError`` during market hours.
     """
+    ensure_market_closed("생성")
     available = unallocated_cash(account, kis_client=kis_client)
     needed = count * starting_balance
     if needed > available:

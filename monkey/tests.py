@@ -907,16 +907,76 @@ class MonkeyApiTests(APITestCase):
         )
         self.client.force_authenticate(user)
 
-        with mock.patch(
-            "monkey.services.KisClient", return_value=FakeKisClient(price=100)
-        ):
-            response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
+        # Killing mid-session would shift the Monkey Index without a trade.
+        response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
+        self.assertEqual(response.status_code, 409)
+        monkey.refresh_from_db()
+        self.assertIsNone(monkey.killed_at)
+        self.assertTrue(Holding.objects.filter(monkey=monkey, stock=stock).exists())
+
+        services.set_trading_enabled(False)
+        response = self.client.post(reverse("monkey-force-kill", args=[monkey.id]))
 
         self.assertEqual(response.status_code, 200)
         monkey.refresh_from_db()
         self.assertFalse(monkey.is_active)
         self.assertIsNotNone(monkey.killed_at)
         self.assertFalse(Holding.objects.filter(monkey=monkey, stock=stock).exists())
+
+    def test_create_endpoints_rejected_while_market_open(self):
+        services.set_trading_enabled(True)
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        account = make_account()
+
+        with mock.patch(
+            "monkey.services.KisClient",
+            return_value=FakeKisClient(balance=1_000_000),
+        ):
+            bulk = self.client.post(
+                reverse("monkey-bulk-create"),
+                {"account": account.id, "count": 2, "starting_balance": 1000},
+                format="json",
+            )
+        single = self.client.post(
+            reverse("monkey-list"),
+            {
+                "account": account.id,
+                "name": "A",
+                "balance": 1000,
+                "initial_balance": 1000,
+            },
+            format="json",
+        )
+
+        self.assertEqual(bulk.status_code, 409)
+        self.assertEqual(single.status_code, 409)
+        self.assertEqual(Monkey.objects.count(), 0)
+
+    def test_update_rejects_equity_changes_while_market_open(self):
+        services.set_trading_enabled(True)
+        user = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(user)
+        monkey = Monkey.objects.create(
+            account=make_account(), name="A", balance=1000, initial_balance=1000
+        )
+        url = reverse("monkey-detail", args=[monkey.id])
+
+        rename = self.client.patch(url, {"name": "B"}, format="json")
+        rebalance = self.client.patch(url, {"balance": 5000}, format="json")
+        kill = self.client.patch(url, {"state": Monkey.State.DEAD}, format="json")
+
+        self.assertEqual(rename.status_code, 200)
+        self.assertEqual(rebalance.status_code, 409)
+        self.assertEqual(kill.status_code, 409)
+        monkey.refresh_from_db()
+        self.assertEqual(monkey.name, "B")
+        self.assertEqual(monkey.balance, 1000)
+        self.assertNotEqual(monkey.state, Monkey.State.DEAD)
 
     def test_force_kill_endpoint_allowed_when_trading_disabled(self):
         # Killing now only transfers holdings to the system monkey, so the
@@ -1828,6 +1888,19 @@ class CandlestickApiTests(APITestCase):
         self.assertEqual(candle["low"], 10100.0)
         self.assertEqual(candle["close"], 10200.0)
         self.assertIn("time", candle)
+        self.assertIsNone(candle["prev_close"])  # no baseline for the day
+
+    def test_candles_carry_their_days_prev_close(self):
+        from monkey.models import MonkeyIndexBaseline, MonkeyIndexTick
+
+        MonkeyIndexBaseline.objects.create(
+            date=timezone.localdate(), base_index=10000.0, base_equity=1000
+        )
+        MonkeyIndexTick.objects.create(value=10100.0)
+
+        for unit in ("1t", "15m", "1d"):
+            candle = services.build_index_candlesticks(unit=unit)[-1]
+            self.assertEqual(candle["prev_close"], 10000.0, unit)
 
     def test_intraday_buckets_are_shifted_to_kst(self):
         from monkey.models import MonkeyIndexTick

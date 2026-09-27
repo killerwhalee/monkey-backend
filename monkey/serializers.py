@@ -218,6 +218,9 @@ class CandlestickSerializer(serializers.Serializer):
     high = serializers.FloatField()
     low = serializers.FloatField()
     close = serializers.FloatField()
+    # The candle's trading-day reference (previous session's close); null when
+    # that day has no index baseline.
+    prev_close = serializers.FloatField(allow_null=True)
 
 
 class DashboardSummarySerializer(serializers.Serializer):

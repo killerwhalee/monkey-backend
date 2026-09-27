@@ -83,7 +83,7 @@ class MonkeyViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         try:
             monkeys = serializer.save()
-        except services.InsufficientCashError as exc:
+        except (services.InsufficientCashError, services.MarketOpenError) as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(
             serializers.MonkeySerializer(monkeys, many=True).data,
@@ -99,10 +99,31 @@ class MonkeyViewSet(viewsets.ModelViewSet):
     def force_kill(self, request, pk=None):
         monkey = self.get_object()
         try:
-            services.kill_monkey(monkey)
-        except services.KillNotAllowedError as exc:
+            services.ensure_market_closed("처분")
+        except services.MarketOpenError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        services.kill_monkey(monkey)
         return Response(self.get_serializer(monkey).data)
+
+    def create(self, request, *args, **kwargs):
+        try:
+            services.ensure_market_closed("생성")
+        except services.MarketOpenError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        # Renames/pauses are harmless; only block edits that move alive equity
+        # (killing via state, or rewriting cash) while the index is ticking.
+        moves_equity = (
+            request.data.get("state") == Monkey.State.DEAD or "balance" in request.data
+        )
+        if moves_equity:
+            try:
+                services.ensure_market_closed("수정")
+            except services.MarketOpenError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return super().update(request, *args, **kwargs)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
