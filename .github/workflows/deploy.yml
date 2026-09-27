@@ -1,36 +1,49 @@
+# Deploy backend to production server on push to main.
+#
+# Runs on the self-hosted runner registered directly on the deploy server
+# (killerwhalee-serv-o), so no SSH hop is needed — the runner IS the deploy
+# target.
+#
+# Server prerequisites:
+#   - uv installed at ~/.local/bin
+#   - backend repo cloned at /home/killerwhalee/monkey/backend
+#   - services grouped under monkey.target (see deploy/systemd/)
+#   - deploy user has passwordless sudo for systemctl restart monkey.target
+#     (/etc/sudoers.d/monkey: killerwhalee ALL=(root) NOPASSWD: /usr/bin/systemctl restart monkey.target)
+
 name: Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: monkey-backend-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    name: Deploy to production
+    runs-on: [self-hosted, serv-o]
+
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          port: ${{ secrets.DEPLOY_PORT }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            set -e
-            export PATH="$HOME/.local/bin:$PATH"
-            cd /home/killerwhalee/monkey/backend
-            git checkout main
-            git pull --ff-only origin main
-            uv sync --frozen
-            # Back up the DB before migrating — the multi-account rollout includes an
-            # irreversible discard-orphans data migration (0029). Production runs
-            # PostgreSQL (see deploy/README.md), so dump with pg_dump rather than copying
-            # the sqlite file. `set -e` aborts the deploy if the backup fails, so the
-            # irreversible migration never runs unprotected.
-            DB_URL="$(grep -E '^DJANGO_DATABASE=' .env | head -n1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
-            mkdir -p "$HOME/monkey/backend/_backups"
-            pg_dump --no-owner "$DB_URL" > "$HOME/monkey/backend/_backups/monkey-db.bak.$(date +%F-%H%M%S).sql"
-            uv run python manage.py migrate --noinput
-            uv run python manage.py collectstatic --noinput
-            sudo systemctl restart monkey.target
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Deploy
+        working-directory: /home/killerwhalee/monkey/backend
+        run: |
+          set -e
+          git fetch origin
+          git reset --hard origin/main
+          uv sync --frozen
+          # Back up the DB before migrating. Production runs PostgreSQL (see
+          # deploy/README.md), so dump with pg_dump rather than copying a sqlite
+          # file. `set -e` aborts the deploy if the backup fails, so migrations
+          # never run unprotected.
+          DB_URL="$(grep -E '^DJANGO_DATABASE=' .env | head -n1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
+          mkdir -p _backups
+          pg_dump --no-owner "$DB_URL" > "_backups/monkey-db.bak.$(date +%F-%H%M%S).sql"
+          uv run python manage.py migrate --noinput
+          uv run python manage.py collectstatic --noinput
+          sudo systemctl restart monkey.target
