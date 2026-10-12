@@ -367,12 +367,12 @@ EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
 
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
 
-DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="noreply@monkey.whalebeta.com")
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="")
 
 FEEDBACK_ADMIN_EMAIL = env("FEEDBACK_ADMIN_EMAIL", default="")
 
 # Public site URL — used to build absolute links/logo URLs in HTML emails.
-SITE_URL = env("SITE_URL", default="https://monkey.whalebeta.com")
+SITE_URL = env("SITE_URL", default="")
 
 
 # Django REST Framework
