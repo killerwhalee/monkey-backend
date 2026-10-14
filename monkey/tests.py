@@ -2273,6 +2273,26 @@ class MonkeyListQueryCountTests(APITestCase):
         self._give_holdings(monkey_b, stocks[1:])
         self.assertEqual(self._count_list_queries(), baseline)
 
+    def test_list_query_count_independent_of_monkey_count(self):
+        stock = Stock.objects.create(market="KOSPI", ticker="000010", name="S")
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=10000)
+        self._give_holdings(monkey, [stock])
+        baseline = self._count_list_queries()
+
+        # More monkeys (each with orders) must not add per-monkey queries — the
+        # old per-monkey ``recent_orders`` lookup was an N+1 here.
+        for i in range(4):
+            other = Monkey.objects.create(
+                name=f"M{i}", balance=1000, initial_balance=10000
+            )
+            self._give_holdings(other, [stock])
+        self.assertEqual(self._count_list_queries(), baseline)
+
+    def test_list_omits_recent_orders(self):
+        Monkey.objects.create(name="A", balance=1000, initial_balance=10000)
+        response = self.client.get(reverse("monkey-list"))
+        self.assertNotIn("recent_orders", response.data[0])
+
 
 class AccountCacheTests(TestCase):
     def setUp(self):

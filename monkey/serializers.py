@@ -8,7 +8,6 @@ from monkey.models import Account, GlobalMonkeyControl, KisAccessToken, Monkey
 
 class MonkeySerializer(serializers.ModelSerializer):
     holdings = serializers.SerializerMethodField()
-    recent_orders = serializers.SerializerMethodField()
     metrics = serializers.SerializerMethodField()
     # `is_active` is now a model property (state == ACTIVE); kept for API compatibility.
     is_active = serializers.ReadOnlyField()
@@ -30,7 +29,6 @@ class MonkeySerializer(serializers.ModelSerializer):
             "killed_at",
             "created_at",
             "holdings",
-            "recent_orders",
             "metrics",
         ]
         # order_interval_seconds is derived from haste at creation, not set directly.
@@ -69,14 +67,6 @@ class MonkeySerializer(serializers.ModelSerializer):
             row["profit"] = extra.get("profit", 0)
             row["profit_rate"] = extra.get("profit_rate", 0.0)
         return data
-
-    def get_recent_orders(self, obj):
-        orders = (
-            Order.objects.filter(monkey=obj)
-            .select_related("monkey", "stock")
-            .order_by("-created_at")[:10]
-        )
-        return OrderSerializer(orders, many=True).data
 
     def get_metrics(self, obj):
         return build_monkey_metrics(obj)
@@ -231,6 +221,30 @@ class DashboardSummarySerializer(serializers.Serializer):
     latest_orders = OrderSerializer(many=True)
 
 
+# Order columns the metrics/holdings math reads. Loading only these (instead of
+# whole rows with the raw KIS JSON payloads) keeps the per-monkey order walk
+# cheap; touching any other field on these instances costs a query per row.
+EXECUTED_ORDER_FIELDS = (
+    "id",
+    "monkey_id",
+    "stock_id",
+    "order_type",
+    "status",
+    "executed_quantity",
+    "executed_price",
+    "estimated_price",
+    "created_at",
+)
+PENDING_ORDER_FIELDS = (
+    "id",
+    "monkey_id",
+    "order_type",
+    "status",
+    "requested_quantity",
+    "estimated_price",
+)
+
+
 def _orders_by_stock(monkey):
     """Executed orders grouped by ``stock_id``, ascending by (created_at, id).
 
@@ -243,7 +257,7 @@ def _orders_by_stock(monkey):
     if prefetched is None:
         prefetched = (
             Order.objects.filter(monkey=monkey, status=Order.StatusChoices.EXECUTED)
-            .select_related("stock")
+            .only(*EXECUTED_ORDER_FIELDS)
             .order_by("created_at", "id")
         )
     grouped = {}
@@ -258,7 +272,9 @@ def _pending_orders_for(monkey):
     prefetched = getattr(monkey, "_pending_orders", None)
     if prefetched is None:
         prefetched = list(
-            Order.objects.filter(monkey=monkey, status=Order.StatusChoices.SUBMITTED)
+            Order.objects.filter(
+                monkey=monkey, status=Order.StatusChoices.SUBMITTED
+            ).only(*PENDING_ORDER_FIELDS)
         )
     return list(prefetched)
 

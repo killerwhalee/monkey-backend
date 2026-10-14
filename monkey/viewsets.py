@@ -47,7 +47,9 @@ class MonkeyViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_system=False)
         # Read paths serialize per-monkey metrics/holdings; prefetch holdings,
         # executed orders (for FIFO) and pending orders (for 주문가능금액) once so
-        # the helpers run no per-monkey/per-stock queries. Excluded for mutating
+        # the helpers run no per-monkey/per-stock queries. Orders load only the
+        # columns the math reads: the raw KIS JSON payloads dominate the row size
+        # and made this prefetch the bulk of the list endpoint's latency. Excluded for mutating
         # actions (e.g. force-kill) so the response reflects post-mutation state
         # rather than a stale prefetch.
         if self.action in ("list", "retrieve", "summary"):
@@ -60,13 +62,15 @@ class MonkeyViewSet(viewsets.ModelViewSet):
                 Prefetch(
                     "orders",
                     queryset=Order.objects.filter(status=Order.StatusChoices.EXECUTED)
-                    .select_related("stock")
+                    .only(*serializers.EXECUTED_ORDER_FIELDS)
                     .order_by("created_at", "id"),
                     to_attr="_executed_orders",
                 ),
                 Prefetch(
                     "orders",
-                    queryset=Order.objects.filter(status=Order.StatusChoices.SUBMITTED),
+                    queryset=Order.objects.filter(
+                        status=Order.StatusChoices.SUBMITTED
+                    ).only(*serializers.PENDING_ORDER_FIELDS),
                     to_attr="_pending_orders",
                 ),
             )
