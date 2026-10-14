@@ -2294,6 +2294,77 @@ class MonkeyListQueryCountTests(APITestCase):
         self.assertNotIn("recent_orders", response.data[0])
 
 
+class OrderPayloadRedactionTests(APITestCase):
+    """The order ledger is public; the raw KIS payloads carry the account number
+    and operator details, which only staff may see."""
+
+    def setUp(self):
+        stock = Stock.objects.create(market="KOSPI", ticker="005930", name="Samsung")
+        monkey = Monkey.objects.create(name="A", balance=1000, initial_balance=1000)
+        self.order = Order.objects.create(
+            monkey=monkey,
+            stock=stock,
+            order_type=Order.OrderTypeChoices.BUY,
+            status=Order.StatusChoices.EXECUTED,
+            requested_quantity=1,
+            executed_quantity=1,
+            estimated_price=100,
+            executed_price=100,
+            kis_request={
+                "CANO": "50330000",
+                "ACNT_PRDT_CD": "01",
+                "PDNO": "005930",
+                "ORD_QTY": "1",
+            },
+            kis_response={"rt_cd": "0", "output": {"ODNO": "0000123"}},
+            execution_detail={
+                "odno": "0000123",
+                "inqr_ip_addr": "10.0.0.1",
+                "ctac_tlno": "010-0000-0000",
+                "ordr_empno": "E1",
+            },
+        )
+
+    def _first_order(self):
+        response = self.client.get(reverse("order-list"))
+        self.assertEqual(response.status_code, 200)
+        return response.data["results"][0]
+
+    def test_public_order_list_masks_account_and_operator_fields(self):
+        order = self._first_order()
+
+        self.assertEqual(order["kis_request"]["CANO"], "***")
+        self.assertEqual(order["kis_request"]["ACNT_PRDT_CD"], "***")
+        self.assertEqual(order["kis_request"]["PDNO"], "005930")
+        self.assertEqual(order["kis_response"]["output"]["ODNO"], "0000123")
+        detail = order["execution_detail"]
+        self.assertEqual(detail["odno"], "0000123")
+        for key in ("inqr_ip_addr", "ctac_tlno", "ordr_empno"):
+            self.assertEqual(detail[key], "***")
+
+    def test_staff_sees_raw_payloads(self):
+        staff = get_user_model().objects.create_user(
+            username="admin", password="pw", is_staff=True
+        )
+        self.client.force_authenticate(staff)
+
+        order = self._first_order()
+
+        self.assertEqual(order["kis_request"]["CANO"], "50330000")
+        self.assertEqual(order["execution_detail"]["inqr_ip_addr"], "10.0.0.1")
+
+    def test_dashboard_summary_and_realtime_push_are_masked(self):
+        from market.serializers import OrderSerializer
+
+        response = self.client.get(reverse("dashboard-summary"))
+        latest = response.data["latest_orders"][0]
+        self.assertEqual(latest["kis_request"]["CANO"], "***")
+
+        # The WebSocket push serializes without a request in context.
+        pushed = OrderSerializer(self.order).data
+        self.assertEqual(pushed["kis_request"]["CANO"], "***")
+
+
 class AccountCacheTests(TestCase):
     def setUp(self):
         self.account = make_account()
