@@ -31,6 +31,38 @@ class HoldingSerializer(serializers.ModelSerializer):
         ]
 
 
+# Keys in the raw KIS payloads that identify the trading account or the
+# operator (account number/product code on the order request; inquiry IP,
+# contact number and employee number on the daily execution record). The order
+# ledger is public, so these are masked for everyone but staff.
+REDACTED_KIS_KEYS = frozenset(
+    {
+        "CANO",
+        "ACNT_PRDT_CD",
+        "inqr_ip_addr",
+        "ctac_tlno",
+        "ordr_empno",
+    }
+)
+REDACTED_VALUE = "***"
+KIS_PAYLOAD_FIELDS = ("kis_request", "kis_response", "execution_detail")
+
+
+def redact_kis_payload(value):
+    """Return ``value`` with every ``REDACTED_KIS_KEYS`` entry masked, recursing
+    into nested dicts/lists (KIS nests records under ``output``/``output1``)."""
+    if isinstance(value, dict):
+        return {
+            key: REDACTED_VALUE
+            if key in REDACTED_KIS_KEYS
+            else redact_kis_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_kis_payload(item) for item in value]
+    return value
+
+
 class OrderSerializer(serializers.ModelSerializer):
     stock = StockSerializer(read_only=True)
     monkey_id = serializers.IntegerField(read_only=True)
@@ -67,3 +99,14 @@ class OrderSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Unredacted payloads only for an authenticated staff request; anything
+        # without a request in context (e.g. the public WebSocket push) is masked.
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not (user and user.is_staff):
+            for field in KIS_PAYLOAD_FIELDS:
+                data[field] = redact_kis_payload(data[field])
+        return data
