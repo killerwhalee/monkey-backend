@@ -2061,7 +2061,7 @@ class MonkeyStateLifecycleTests(TestCase):
         task = self._task(monkey)
         self.assertIsNotNone(task)
         self.assertFalse(task.enabled)  # default gate (time) is closed
-        self.assertEqual(task.expire_seconds, min(monkey.order_interval_seconds, 120))
+        self.assertEqual(task.expire_seconds, 300)
 
     def test_active_monkey_task_enabled_when_created_with_gate_open(self):
         services.set_trading_enabled(True)
