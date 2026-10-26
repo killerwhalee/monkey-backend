@@ -37,13 +37,7 @@ jobs:
           git fetch origin
           git reset --hard origin/main
           uv sync --frozen
-          # Back up the DB before migrating. Production runs PostgreSQL (see
-          # deploy/README.md), so dump with pg_dump rather than copying a sqlite
-          # file. `set -e` aborts the deploy if the backup fails, so migrations
-          # never run unprotected.
-          DB_URL="$(grep -E '^DJANGO_DATABASE=' .env | head -n1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
-          mkdir -p _backups
-          pg_dump --no-owner "$DB_URL" > "_backups/monkey-db.bak.$(date +%F-%H%M%S).sql"
+          # No pre-deploy DB dump: the DB is backed up daily by serv-o's ops-backup.timer (restic).
           uv run python manage.py migrate --noinput
           uv run python manage.py collectstatic --noinput
           sudo systemctl restart monkey.target
